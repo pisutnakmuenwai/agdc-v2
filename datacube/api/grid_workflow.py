@@ -170,10 +170,12 @@ class GridWorkflow(object):
 
             if query.geopolygon:
                 # Get a rough region of tiles
-                query_tiles = set(
-                    tile_index for tile_index, tile_geobox in
-                    self.grid_spec.tiles_inside_geopolygon(query.geopolygon))
-
+                for tile_index, tile_geobox in self.grid_spec.tiles_inside_geopolygon(query.geopolygon):
+                    print(tile_index)
+                query_tiles = set([tile_index for tile_index, tile_geobox in self.grid_spec.tiles_inside_geopolygon(query.geopolygon)])
+                # NOTE(map) : This line doesn't work.  Need the [] for some reason.
+                #query_tiles = set(
+                #tile_index for tile_index, tile_geobox in self.grid_spec.tiles_inside_geopolygon(query.geopolygon))
                 for dataset in datasets:
                     # Go through our datasets and see which tiles each dataset produces, and whether they intersect
                     # our query geopolygon.
@@ -304,7 +306,7 @@ class GridWorkflow(object):
         return self.tile_sources(observations, query_group_by(**query))
 
     @staticmethod
-    def load(tile, measurements=None, dask_chunks=None, fuse_func=None, resampling=None):
+    def load(tile, measurements=None, dask_chunks=None, fuse_func=None, resampling=None, skip_broken_datasets=False):
         """
         Load data for a cell/tile.
 
@@ -348,7 +350,7 @@ class GridWorkflow(object):
         measurements = set_resampling_method(measurements, resampling)
 
         dataset = Datacube.load_data(tile.sources, tile.geobox, measurements.values(), dask_chunks=dask_chunks,
-                                     fuse_func=fuse_func)
+                                     fuse_func=fuse_func, skip_broken_datasets=skip_broken_datasets)
 
         return dataset
 

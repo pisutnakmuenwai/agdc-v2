@@ -555,10 +555,15 @@ class DatasetResource(object):
         """
         with self._db.connect() as connection:
             if not include_sources:
-                return self._make(connection.get_dataset(id_), full_info=True)
+                dataset = connection.get_dataset(id_)
+                return self._make(dataset, full_info=True) if dataset else None
 
             datasets = {result['id']: (self._make(result, full_info=True), result)
                         for result in connection.get_dataset_sources(id_)}
+
+        if not datasets:
+            # No dataset found
+            return None
 
         for dataset, result in datasets.values():
             dataset.metadata_doc['lineage']['source_datasets'] = {
@@ -670,7 +675,7 @@ class DatasetResource(object):
             # can always add more metadata
             tuple(): changes.allow_extension,
         }
-        allowed.update(updates_allowed)
+        allowed.update(updates_allowed or {})
 
         doc_changes = get_doc_changes(existing.metadata_doc, jsonify_document(dataset.metadata_doc))
         good_changes, bad_changes = changes.classify_changes(doc_changes, allowed)
@@ -684,9 +689,13 @@ class DatasetResource(object):
         :param updates_allowed: Allowed updates
         :return:
         """
+        existing = self.get(dataset.id)
         can_update, safe_changes, unsafe_changes = self.can_update(dataset, updates_allowed)
 
         if not safe_changes and not unsafe_changes:
+            if dataset.local_uri != existing.local_uri:
+                with self._db.begin() as transaction:
+                    transaction.ensure_dataset_location(dataset.id, dataset.local_uri)
             _LOG.info("No changes detected for dataset %s", dataset.id)
             return
 
@@ -705,7 +714,6 @@ class DatasetResource(object):
         sources_tmp = dataset.type.dataset_reader(dataset.metadata_doc).sources
         dataset.type.dataset_reader(dataset.metadata_doc).sources = {}
         try:
-            existing = self.get(dataset.id)
             product = self.types.get_by_name(dataset.type.name)
             with self._db.begin() as transaction:
                 if not transaction.update_dataset(dataset.metadata_doc, dataset.id, product.id):

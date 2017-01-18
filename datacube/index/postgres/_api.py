@@ -68,6 +68,8 @@ def _split_uri(uri):
     ('eods', 'LS7_ETM_SYS_P31_GALPGS01-002_101_065_20160127')
     >>> _split_uri('file://rhe-test-dev.prod.lan/data/fromASA/LANDSAT-7.89274.S4A2C1D3R3')
     ('file', '//rhe-test-dev.prod.lan/data/fromASA/LANDSAT-7.89274.S4A2C1D3R3')
+    >>> _split_uri('file:///C:/tmp/first/something.yaml')
+    ('file', '///C:/tmp/first/something.yaml')
     """
     comp = uri.split(':')
     scheme = comp[0]
@@ -898,7 +900,7 @@ class PostgresDbAPI(object):
 
         :returns bool: Was the location deleted?
         """
-        scheme, body = uri.split(':')
+        scheme, body = _split_uri(uri)
         res = self._connection.execute(
             delete(DATASET_LOCATION).where(
                 and_(

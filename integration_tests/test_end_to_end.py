@@ -158,16 +158,20 @@ def check_open_with_dc(index):
 
     data_array = dc.load(product='ls5_nbar_albers', measurements=['blue'], stack='variable')
     assert data_array.shape
+    assert (data_array != -999).any()
 
     data_array = dc.load(product='ls5_nbar_albers', measurements=['blue'], time='1992-03-23T23:14:25.500000')
     assert data_array['blue'].shape[0] == 1
+    assert (data_array.blue != -999).any()
 
     data_array = dc.load(product='ls5_nbar_albers', measurements=['blue'], latitude=-35.3, longitude=149.1)
     assert data_array['blue'].shape[1:] == (1, 1)
+    assert (data_array.blue != -999).any()
 
     data_array = dc.load(product='ls5_nbar_albers', latitude=(-35, -36), longitude=(149, 150), stack='variable')
     assert data_array.ndim == 4
     assert 'variable' in data_array.dims
+    assert (data_array != -999).any()
 
     lazy_data_array = dc.load(product='ls5_nbar_albers', latitude=(-35, -36), longitude=(149, 150),
                               stack='variable', dask_chunks={'time': 1, 'x': 1000, 'y': 1000})
@@ -212,6 +216,7 @@ def check_open_with_dc(index):
     resamp = ['nearest', 'cubic', 'bilinear', 'cubic_spline', 'lanczos', 'average']
     results = {}
 
+    # WTF
     def calc_max_change(da):
         midline = int(da.shape[0] * 0.5)
         a = int(abs(da[midline, :-1].data - da[midline, 1:].data).max())
@@ -232,7 +237,7 @@ def check_open_with_dc(index):
 
 def check_open_with_grid_workflow(index):
     type_name = 'ls5_nbar_albers'
-    dt = index.datasets.types.get_by_name(type_name)
+    dt = index.products.get_by_name(type_name)
 
     from datacube.api.grid_workflow import GridWorkflow
     gw = GridWorkflow(index, dt.grid_spec)

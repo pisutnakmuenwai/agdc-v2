@@ -3,7 +3,7 @@
 import versioneer
 from setuptools import setup, find_packages
 
-tests_require = ['pytest', 'pytest-cov', 'mock', 'pep8', 'pylint', 'hypothesis']
+tests_require = ['pytest', 'pytest-cov', 'mock', 'pep8', 'pylint==1.6.4', 'hypothesis', 'compliance-checker']
 
 extras_require = {
     'performance': ['ciso8601', 'bottleneck'],
@@ -86,6 +86,7 @@ setup(
         'console_scripts': [
             'datacube-search = datacube.scripts.search_tool:cli',
             'datacube = datacube.scripts.cli_app:cli',
+            'datacube-stacker = datacube_apps.stacker:main',
             'pixeldrill = datacube_apps.pixeldrill:main [interactive]',
             'movie_generator = datacube_apps.movie_generator:main'
         ]

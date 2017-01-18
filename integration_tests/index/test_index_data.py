@@ -9,6 +9,7 @@ from __future__ import absolute_import
 import datetime
 
 import pytest
+import sys
 from pathlib import Path
 
 from datacube.index.exceptions import DuplicateRecordError
@@ -66,7 +67,7 @@ _EXAMPLE_LS7_NBAR_DATASET_FILE = Path(__file__).parent.joinpath('ls7-nbar-exampl
 
 
 def test_archive_datasets(index, db, local_config, default_metadata_type):
-    dataset_type = index.datasets.types.add_document(_pseudo_telemetry_dataset_type)
+    dataset_type = index.products.add_document(_pseudo_telemetry_dataset_type)
     with db.begin() as transaction:
         was_inserted = transaction.insert_dataset(
             _telemetry_dataset,
@@ -94,7 +95,7 @@ def test_index_duplicate_dataset(index, db, local_config, default_metadata_type)
     :type index: datacube.index._api.Index
     :type db: datacube.index.postgres._api.PostgresDb
     """
-    dataset_type = index.datasets.types.add_document(_pseudo_telemetry_dataset_type)
+    dataset_type = index.products.add_document(_pseudo_telemetry_dataset_type)
     assert not index.datasets.has(_telemetry_uuid)
 
     with db.begin() as transaction:
@@ -125,7 +126,7 @@ def test_transactions(index, db, local_config, default_metadata_type):
     """
     assert not index.datasets.has(_telemetry_uuid)
 
-    dataset_type = index.datasets.types.add_document(_pseudo_telemetry_dataset_type)
+    dataset_type = index.products.add_document(_pseudo_telemetry_dataset_type)
     with db.begin() as transaction:
         was_inserted = transaction.insert_dataset(
             _telemetry_dataset,
@@ -143,15 +144,36 @@ def test_transactions(index, db, local_config, default_metadata_type):
     assert not index.datasets.has(_telemetry_uuid)
 
 
+def test_get_missing_things(index):
+    """
+    The get(id) methods should return None if the object doesn't exist.
+
+    :type index: datacube.index._api.Index
+    """
+    uuid_ = '18474b58-c8a6-11e6-a4b3-185e0f80a5c0'
+    missing_thing = index.datasets.get(uuid_, include_sources=False)
+    assert missing_thing is None, "get() should return none when it doesn't exist"
+
+    missing_thing = index.datasets.get(uuid_, include_sources=True)
+    assert missing_thing is None, "get() should return none when it doesn't exist"
+
+    id_ = sys.maxsize
+    missing_thing = index.metadata_types.get(id_)
+    assert missing_thing is None, "get() should return none when it doesn't exist"
+
+    missing_thing = index.products.get(id_)
+    assert missing_thing is None, "get() should return none when it doesn't exist"
+
+
 def test_index_dataset_with_location(index, default_metadata_type):
     """
     :type index: datacube.index._api.Index
-    :type default_collection: datacube.model.DatasetType
+    :type default_metadata_type: datacube.model.MetadataType
     """
     first_file = Path('/tmp/first/something.yaml').absolute()
     second_file = Path('/tmp/second/something.yaml').absolute()
 
-    type_ = index.datasets.types.add_document(_pseudo_telemetry_dataset_type)
+    type_ = index.products.add_document(_pseudo_telemetry_dataset_type)
     dataset = Dataset(type_, _telemetry_dataset, first_file.as_uri())
     index.datasets.add(dataset)
     stored = index.datasets.get(dataset.id)

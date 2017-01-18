@@ -10,11 +10,11 @@ from datetime import datetime
 
 import numpy
 
-from datacube.storage.masking import describe_flags_def
 from datacube.model import CRS, BoundingBox
+from datacube.storage.masking import describe_flags_def
 from datacube.utils import geometry, data_resolution_and_offset
 
-# pylint: disable=ungrouped-imports,wrong-import-order
+# pylint: disable=ungrouped-imports
 try:
     from datacube.storage.netcdf_safestrings import SafeStringsDataset as Dataset
 except TypeError:  # The above fails when netCDF4.Dataset is mocked, eg in RTD
@@ -214,9 +214,9 @@ def create_grid_mapping_variable(nco, crs):
     yres, yoff = data_resolution_and_offset(nco[dims[0]])
     crs_var.GeoTransform = [xoff, xres, 0.0, yoff, 0.0, yres]
 
-    left, right = nco[dims[1]][0]-0.5*xres, nco[dims[1]][-1]+0.5*xres
-    bottom, top = nco[dims[0]][0]-0.5*yres, nco[dims[0]][-1]+0.5*yres
-    _write_geographical_extents_attributes(nco, geometry.box(BoundingBox(left, bottom, right, top), crs=crs))
+    left, right = nco[dims[1]][0] - 0.5 * xres, nco[dims[1]][-1] + 0.5 * xres
+    bottom, top = nco[dims[0]][0] - 0.5 * yres, nco[dims[0]][-1] + 0.5 * yres
+    _write_geographical_extents_attributes(nco, geometry.box(left, bottom, right, top, crs=crs))
 
     return crs_var
 

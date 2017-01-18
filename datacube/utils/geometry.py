@@ -293,6 +293,9 @@ def _wrap_binary_geom(method):
 class Geometry(object):
     """
     Geometry with CRS
+
+    :type _geom: ogr.Geometry
+    :type crs: CRS
     """
     _geom_makers = {
         'Point': _make_point,
@@ -312,10 +315,17 @@ class Geometry(object):
         ogr.wkbMultiPolygon: 'MultiPolygon',
     }
 
+    contains = _wrap_binary_bool(ogr.Geometry.Contains)
+    crosses = _wrap_binary_bool(ogr.Geometry.Crosses)
+    disjoint = _wrap_binary_bool(ogr.Geometry.Disjoint)
     intersects = _wrap_binary_bool(ogr.Geometry.Intersects)
     touches = _wrap_binary_bool(ogr.Geometry.Touches)
+    within = _wrap_binary_bool(ogr.Geometry.Within)
 
+    difference = _wrap_binary_geom(ogr.Geometry.Difference)
     intersection = _wrap_binary_geom(ogr.Geometry.Intersection)
+    symmetric_difference = _wrap_binary_geom(ogr.Geometry.SymDifference)
+    union = _wrap_binary_geom(ogr.Geometry.Union)
 
     def __init__(self, geo, crs=None):
         self.crs = crs
@@ -326,13 +336,49 @@ class Geometry(object):
         return Geometry._geom_types[self._geom.GetGeometryType()]
 
     @property
-    def points(self):
+    def is_empty(self):
+        return self._geom.IsEmpty()
+
+    @property
+    def is_valid(self):
+        return self._geom.IsValid()
+
+    @property
+    def boundary(self):
+        return _make_geom_from_ogr(self._geom.Boundary(), self.crs)
+
+    @property
+    def centroid(self):
+        return _make_geom_from_ogr(self._geom.Centroid(), self.crs)
+
+    @property
+    def coords(self):
         return self._geom.GetPoints()
 
     @property
-    def boundingbox(self):
+    def points(self):
+        return self.coords
+
+    @property
+    def length(self):
+        return self._geom.Length()
+
+    @property
+    def area(self):
+        return self._geom.GetArea()
+
+    @property
+    def convex_hull(self):
+        return _make_geom_from_ogr(self._geom.ConvexHull(), self.crs)
+
+    @property
+    def envelope(self):
         minx, maxx, miny, maxy = self._geom.GetEnvelope()
         return BoundingBox(left=minx, right=maxx, bottom=miny, top=maxy)
+
+    @property
+    def boundingbox(self):
+        return self.envelope
 
     @property
     def wkt(self):
@@ -350,6 +396,15 @@ class Geometry(object):
         clone.Segmentize(resolution)
         return _make_geom_from_ogr(clone, self.crs)
 
+    def interpolate(self, distance):
+        return _make_geom_from_ogr(self._geom.Value(distance), self.crs)
+
+    def buffer(self, distance, quadsecs=30):
+        return _make_geom_from_ogr(self._geom.Buffer(distance, quadsecs), self.crs)
+
+    def simplify(self, tolerance):
+        return _make_geom_from_ogr(self._geom.Simplify(tolerance), self.crs)
+
     def to_crs(self, crs, resolution=None):
         if self.crs == crs:
             return self
@@ -363,6 +418,19 @@ class Geometry(object):
         clone.Transform(transform)
 
         return _make_geom_from_ogr(clone, crs)  # pylint: disable=protected-access
+
+    def __iter__(self):
+        for i in range(self._geom.GetGeometryCount()):
+            yield _make_geom_from_ogr(self._geom.GetGeometryRef(i), self.crs)
+
+    def __nonzero__(self):
+        return not self.is_empty
+
+    def __bool__(self):
+        return not self.is_empty
+
+    def __eq__(self, other):
+        return self.crs == other.crs and self._geom.Equal(other._geom)  # pylint: disable=protected-access
 
     def __str__(self):
         return 'Geometry(%s, %r)' % (self.__geo_interface__, self.crs)
@@ -388,21 +456,21 @@ def polygon(outer, crs, *inners):
     return Geometry({'type': 'Polygon', 'coordinates': (outer, )+inners}, crs=crs)
 
 
-def box(boundingbox, crs):
-    points = [
-        (boundingbox.left, boundingbox.top),
-        (boundingbox.right, boundingbox.top),
-        (boundingbox.right, boundingbox.bottom),
-        (boundingbox.left, boundingbox.bottom),
-        (boundingbox.left, boundingbox.top),
-    ]
+def box(left, bottom, right, top, crs):
+    points = [(left, bottom), (left, top), (right, top), (right, bottom), (left, bottom)]
     return polygon(points, crs=crs)
 
 
-def union_cascaded(geoms):
+###########################################
+# Multi-geometry operations
+###########################################
+
+
+def unary_union(geoms):
     """
     compute union of multiple (multi)polygons efficiently
     """
+    # pylint: disable=protected-access
     geom = ogr.Geometry(ogr.wkbMultiPolygon)
     crs = None
     for g in geoms:
@@ -410,7 +478,19 @@ def union_cascaded(geoms):
             assert crs == g.crs
         else:
             crs = g.crs
+        if g._geom.GetGeometryType() == ogr.wkbPolygon:
+            geom.AddGeometry(g._geom)
+        elif g._geom.GetGeometryType() == ogr.wkbMultiPolygon:
+            for poly in g._geom:
+                geom.AddGeometry(poly)
+        else:
+            raise ValueError('"%s" is not supported' % g.type)
+    union = geom.UnionCascaded()
+    return _make_geom_from_ogr(union, crs)
 
-        geom.AddGeometry(g._geom)  # pylint: disable=protected-access
-    geom.UnionCascaded()
-    return _make_geom_from_ogr(geom.GetGeometryRef(0).Clone() if geom.GetGeometryCount() else geom, crs)
+
+def unary_intersection(geoms):
+    """
+    compute intersection of multiple (multi)polygons
+    """
+    return functools.reduce(Geometry.intersection, geoms)
