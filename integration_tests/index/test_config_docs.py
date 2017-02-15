@@ -7,7 +7,10 @@ from __future__ import absolute_import
 import copy
 
 import pytest
-from datacube.index.postgres._fields import NumericRangeDocField
+
+from datacube.index.postgres import PostgresDb
+from datacube.index.postgres._fields import NumericRangeDocField, PgField
+from datacube.model import DatasetType
 from datacube.model import Range, Dataset
 from datacube.utils import changes
 
@@ -48,7 +51,7 @@ _DATASET_METADATA = {
 
 def test_metadata_indexes_views_exist(db, default_metadata_type):
     """
-    :type db: datacube.index.postgres._api.PostgresDb
+    :type db: datacube.index.postgres._connections.PostgresDb
     :type default_metadata_type: datacube.model.MetadataType
     """
     # Metadata indexes should no longer exist.
@@ -60,7 +63,7 @@ def test_metadata_indexes_views_exist(db, default_metadata_type):
 
 def test_dataset_indexes_views_exist(db, ls5_nbar_gtiff_type):
     """
-    :type db: datacube.index.postgres._api.PostgresDb
+    :type db: datacube.index.postgres._connections.PostgresDb
     :type ls5_nbar_gtiff_type: datacube.model.DatasetType
     """
     assert ls5_nbar_gtiff_type.name == 'ls5_nbart_p54_gtiff'
@@ -79,7 +82,7 @@ def test_dataset_indexes_views_exist(db, ls5_nbar_gtiff_type):
     assert not _object_exists(db, 'dix_ls5_nbart_p54_gtiff_gsi'), "indexed=false field gsi shouldn't have an index"
 
 
-def test_dataset_composit_indexes_exist(db, ls5_nbar_gtiff_type):
+def test_dataset_composite_indexes_exist(db, ls5_nbar_gtiff_type):
     # This type has fields named lat/lon/time, so composite indexes should now exist for them:
     # (following the naming conventions)
     assert _object_exists(db, "dix_ls5_nbart_p54_gtiff_time_lat_lon")
@@ -89,6 +92,47 @@ def test_dataset_composit_indexes_exist(db, ls5_nbar_gtiff_type):
     assert not _object_exists(db, "dix_ls5_nbart_p54_gtiff_lat")
     assert not _object_exists(db, "dix_ls5_nbart_p54_gtiff_lon")
     assert not _object_exists(db, "dix_ls5_nbart_p54_gtiff_time")
+
+
+def test_field_expression_unchanged(ls5_nbar_gtiff_type):
+    # type: (DatasetType) -> None
+
+    # We're checking for accidental changes here in our field-to-SQL code
+
+    # If we started outputting a different expression they would quietly no longer match the expression
+    # indexes that exist in our DBs.
+
+    # The lat field on the default 'eo' metadata type.
+    # A multi-valued float range.
+    field = ls5_nbar_gtiff_type.metadata_type.dataset_fields['lat']
+    assert isinstance(field, PgField)
+    assert field.sql_expression == (
+        "agdc.float8range("
+        "least("
+        "CAST(agdc.dataset.metadata #>> '{extent, coord, ur, lat}' AS DOUBLE PRECISION), "
+        "CAST(agdc.dataset.metadata #>> '{extent, coord, lr, lat}' AS DOUBLE PRECISION), "
+        "CAST(agdc.dataset.metadata #>> '{extent, coord, ul, lat}' AS DOUBLE PRECISION), "
+        "CAST(agdc.dataset.metadata #>> '{extent, coord, ll, lat}' AS DOUBLE PRECISION)), "
+        "greatest("
+        "CAST(agdc.dataset.metadata #>> '{extent, coord, ur, lat}' AS DOUBLE PRECISION), "
+        "CAST(agdc.dataset.metadata #>> '{extent, coord, lr, lat}' AS DOUBLE PRECISION), "
+        "CAST(agdc.dataset.metadata #>> '{extent, coord, ul, lat}' AS DOUBLE PRECISION),"
+        " CAST(agdc.dataset.metadata #>> '{extent, coord, ll, lat}' AS DOUBLE PRECISION)), "
+        "'[]')")
+
+    # A single string value
+    field = ls5_nbar_gtiff_type.metadata_type.dataset_fields['platform']
+    assert isinstance(field, PgField)
+    assert field.sql_expression == (
+        "agdc.dataset.metadata #>> '{platform, code}'"
+    )
+
+    # A single integer value
+    field = ls5_nbar_gtiff_type.metadata_type.dataset_fields['orbit']
+    assert isinstance(field, PgField)
+    assert field.sql_expression == (
+        "CAST(agdc.dataset.metadata #>> '{acquisition, platform_orbit}' AS INTEGER)"
+    )
 
 
 def _object_exists(db, index_name):
@@ -124,7 +168,7 @@ def test_update_dataset(index, ls5_nbar_gtiff_doc, example_ls5_nbar_metadata_doc
     assert ls5_nbar_gtiff_type
 
     example_ls5_nbar_metadata_doc['lineage']['source_datasets'] = {}
-    dataset = Dataset(ls5_nbar_gtiff_type, example_ls5_nbar_metadata_doc, 'file:///test/doc.yaml')
+    dataset = Dataset(ls5_nbar_gtiff_type, example_ls5_nbar_metadata_doc, 'file:///test/doc.yaml', sources={})
     dataset = index.datasets.add(dataset)
     assert dataset
 
@@ -135,7 +179,7 @@ def test_update_dataset(index, ls5_nbar_gtiff_doc, example_ls5_nbar_metadata_doc
 
     # update location
     assert index.datasets.get(dataset.id).local_uri == 'file:///test/doc.yaml'
-    update = Dataset(ls5_nbar_gtiff_type, example_ls5_nbar_metadata_doc, 'file:///test/doc2.yaml')
+    update = Dataset(ls5_nbar_gtiff_type, example_ls5_nbar_metadata_doc, 'file:///test/doc2.yaml', sources={})
     index.datasets.update(update)
     updated = index.datasets.get(dataset.id)
     assert updated.local_uri == 'file:///test/doc2.yaml'
@@ -336,3 +380,22 @@ def test_filter_types_by_search(index, ls5_nbar_gtiff_type):
         product_type='nbar',
     ))
     assert res == []
+
+
+def test_update_metadata_type(db, index, ls5_nbar_gtiff_type):
+    type_doc = copy.deepcopy(ls5_nbar_gtiff_type.metadata_type.definition)
+    type_doc['dataset']['search_fields']['test_indexed'] = {
+        'description': 'indexed test field',
+        'offset': ['test', 'indexed']
+    }
+    type_doc['dataset']['search_fields']['test_not_indexed'] = {
+        'description': 'not indexed test field',
+        'offset': ['test', 'not', 'indexed'],
+        'indexed': False
+    }
+
+    index.metadata_types.update_document(type_doc)
+
+    assert ls5_nbar_gtiff_type.name == 'ls5_nbart_p54_gtiff'
+    assert _object_exists(db, "dix_ls5_nbart_p54_gtiff_test_indexed")
+    assert not _object_exists(db, "dix_ls5_nbart_p54_gtiff_test_not_indexed")

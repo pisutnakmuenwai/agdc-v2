@@ -11,13 +11,10 @@ import numpy
 import xarray
 from affine import Affine
 from dask import array as da
-from rasterio.coords import BoundingBox
 
-from datacube.model import CRS
 from ..config import LocalConfig
 from ..compat import string_types
 from ..index import index_connect
-from ..model import GeoBox
 from ..storage.storage import DatasetSource, reproject_and_fuse
 from ..utils import geometry, intersects, data_resolution_and_offset
 from .query import Query, query_group_by, query_geopolygon
@@ -35,19 +32,13 @@ def _xarray_affine(obj):
     return Affine.translation(xoff, yoff) * Affine.scale(xres, yres)
 
 
-def _get_min_max(data):
-    res, off = data_resolution_and_offset(data)
-    left, right = numpy.asscalar(data[0]-0.5*res), numpy.asscalar(data[-1]+0.5*res)
-    return (right, left) if res < 0 else (left, right)
-
-
 def _xarray_extent(obj):
     return obj.geobox.extent
 
 
 def _xarray_geobox(obj):
     dims = obj.crs.dimensions
-    return GeoBox(obj[dims[1]].size, obj[dims[0]].size, obj.affine, obj.crs)
+    return geometry.GeoBox(obj[dims[1]].size, obj[dims[0]].size, obj.affine, obj.crs)
 
 
 xarray.Dataset.geobox = property(_xarray_geobox)
@@ -303,50 +294,38 @@ class Datacube(object):
             assert resolution is None, "'like' and 'resolution' are not supported together"
             assert align is None, "'like' and 'align' are not supported together"
             geobox = like.geobox
-        elif output_crs:
-            if not resolution:
-                raise RuntimeError("Must specify 'resolution' when specifying 'output_crs'")
-            crs = CRS(output_crs)
-            geobox = GeoBox.from_geopolygon(query_geopolygon(**query) or get_bounds(observations, crs),
-                                            resolution, crs, align)
         else:
-            grid_spec = self.index.products.get_by_name(product).grid_spec
-            if not (grid_spec and grid_spec.crs):
-                raise RuntimeError("Product has no CRS. Must specify 'output_crs' and 'resolution'")
-
-            if not resolution:
-                if not (grid_spec and grid_spec.resolution):
-                    raise RuntimeError("Product has no resolution. Must specify 'resolution'")
-                resolution = grid_spec.resolution
-                align = align or grid_spec.alignment
-
-            geobox = GeoBox.from_geopolygon(query_geopolygon(**query) or get_bounds(observations, grid_spec.crs),
-                                            resolution, grid_spec.crs, align)
+            if output_crs:
+                if not resolution:
+                    raise RuntimeError("Must specify 'resolution' when specifying 'output_crs'")
+                crs = geometry.CRS(output_crs)
+            else:
+                grid_spec = self.index.products.get_by_name(product).grid_spec
+                if not grid_spec or not grid_spec.crs:
+                    raise RuntimeError("Product has no default CRS. Must specify 'output_crs' and 'resolution'")
+                crs = grid_spec.crs
+                if not resolution:
+                    if not grid_spec.resolution:
+                        raise RuntimeError("Product has no default resolution. Must specify 'resolution'")
+                    resolution = grid_spec.resolution
+                    align = align or grid_spec.alignment
+            geobox = geometry.GeoBox.from_geopolygon(query_geopolygon(**query) or get_bounds(observations, crs),
+                                                     resolution, crs, align)
 
         group_by = query_group_by(**query)
-        sources = self.group_datasets(observations, group_by)
+        grouped = self.group_datasets(observations, group_by)
 
         measurements = self.index.products.get_by_name(product).lookup_measurements(measurements)
         measurements = set_resampling_method(measurements, resampling)
 
+        result = self.load_data(grouped, geobox, measurements.values(),
+                                fuse_func=fuse_func, dask_chunks=dask_chunks)
         if not stack:
-            return self.load_data(sources, geobox, measurements.values(),
-                                  fuse_func=fuse_func, dask_chunks=dask_chunks)
+            return result
         else:
             if not isinstance(stack, string_types):
                 stack = 'measurement'
-            return self._get_data_array(sources, geobox, measurements.values(),
-                                        var_dim_name=stack, fuse_func=fuse_func, dask_chunks=dask_chunks)
-
-    def _get_data_array(self, sources, geobox, measurements, var_dim_name='measurement',
-                        fuse_func=None, dask_chunks=None):
-        data_dict = OrderedDict()
-        for measurement in measurements:
-            name = measurement['name']
-            data_dict[name] = self.measurement_data(sources, geobox, measurement,
-                                                    fuse_func=fuse_func, dask_chunks=dask_chunks)
-
-        return _stack_vars(data_dict, var_dim_name)
+            return result.to_array(dim=stack)
 
     def product_observations(self, **kwargs):
         warnings.warn("product_observations() has been renamed to find_datasets() and will eventually be removed",
@@ -407,7 +386,7 @@ class Datacube(object):
         data = numpy.empty(len(groups), dtype=object)
         for index, group in enumerate(groups):
             data[index] = group.datasets
-        coords = [v.key for v in groups]
+        coords = [sort_key(v.datasets[0]) for v in groups]
         sources = xarray.DataArray(data, dims=[dimension], coords=[coords])
         sources[dimension].attrs['units'] = units
         return sources
@@ -478,7 +457,7 @@ class Datacube(object):
         Load data from :meth:`group_datasets` into an :class:`xarray.Dataset`.
 
         :param xarray.DataArray sources:
-            DataArray holding a list of :class:`datacube.model.Dataset`s, grouped along the time dimension
+            DataArray holding a list of :class:`datacube.model.Dataset`, grouped along the time dimension
 
         :param GeoBox geobox:
             A GeoBox defining the output spatial projection and resolution
@@ -664,23 +643,3 @@ def _make_dask_array(sources, geobox, measurement, fuse_func=None, dask_chunks=N
     if irr_chunks != sliced_irr_chunks:
         data = data.rechunk(chunks=(irr_chunks + grid_chunks))
     return data
-
-
-def _stack_vars(data_dict, var_dim_name, stack_name=None):
-    if not data_dict:
-        return xarray.DataArray(None)
-    if len(data_dict) == 1:
-        key, value = data_dict.popitem()
-        value.coords[var_dim_name] = key
-        if stack_name:
-            value.name = stack_name
-        return value
-    labels = list(data_dict.keys())
-
-    stack = xarray.concat(
-        [data_dict[var_name] for var_name in labels],
-        dim=xarray.DataArray(labels, name=var_dim_name, dims=var_dim_name),
-        coords='minimal')
-    if stack_name:
-        stack.name = stack_name
-    return stack

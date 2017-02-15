@@ -5,26 +5,36 @@ API for dataset indexing, access and search.
 from __future__ import absolute_import
 
 import logging
+import warnings
+from collections import namedtuple
+from uuid import UUID
 
 from cachetools.func import lru_cache
+
 from datacube import compat
+from datacube.index.fields import Field
 from datacube.model import Dataset, DatasetType, MetadataType
 from datacube.utils import InvalidDocException, jsonify_document, changes
 from datacube.utils.changes import get_doc_changes, check_doc_unchanged
-
 from . import fields
-from .exceptions import DuplicateRecordError, UnknownFieldError
+from .exceptions import DuplicateRecordError
 
 _LOG = logging.getLogger(__name__)
 
+try:
+    from typing import Any, Iterable, Mapping, Set, Tuple, Union
+except ImportError:
+    pass
+
+
 # It's a public api, so we can't reorganise old methods.
-# pylint: disable=too-many-public-methods
+# pylint: disable=too-many-public-methods, too-many-lines
 
 
 class MetadataTypeResource(object):
     def __init__(self, db):
         """
-        :type db: datacube.index.postgres._api.PostgresDb
+        :type db: datacube.index.postgres._connections.PostgresDb
         """
         self._db = db
 
@@ -226,13 +236,13 @@ class MetadataTypeResource(object):
 
 class ProductResource(object):
     """
-    :type _db: datacube.index.postgres._api.PostgresDb
+    :type _db: datacube.index.postgres._connections.PostgresDb
     :type metadata_type_resource: MetadataTypeResource
     """
 
     def __init__(self, db, metadata_type_resource):
         """
-        :type db: datacube.index.postgres._api.PostgresDb
+        :type db: datacube.index.postgres._connections.PostgresDb
         :type metadata_type_resource: MetadataTypeResource
         """
         self._db = db
@@ -485,30 +495,41 @@ class ProductResource(object):
         :param dict query:
         :rtype: __generator[(DatasetType, dict)]
         """
+
+        def _listify(v):
+            return v if isinstance(v, list) else [v]
+
         for type_ in self.get_all():
-            q = query.copy()
-            if q.pop('product', type_.name) != type_.name:
+            remaining_matchable = query.copy()
+            # If they specified specific product/metadata-types, we can quickly skip non-matches.
+            if type_.name not in _listify(remaining_matchable.pop('product', type_.name)):
                 continue
-            if q.pop('metadata_type', type_.metadata_type.name) != type_.metadata_type.name:
+            if type_.metadata_type.name not in _listify(remaining_matchable.pop('metadata_type',
+                                                                                type_.metadata_type.name)):
                 continue
 
-            for key, value in list(q.items()):
-                try:
-                    exprs = fields.to_expressions(type_.metadata_type.dataset_fields.get, **{key: value})
-                except UnknownFieldError as e:
+            # Check that all the keys they specified match this product.
+            for key, value in list(remaining_matchable.items()):
+                field = type_.metadata_type.dataset_fields.get(key)
+                if not field:
+                    # This type doesn't have that field, so it cannot match.
+                    break
+                if field.extract(type_.metadata_doc) is None:
+                    # It has this field but it's not defined in the type doc, so it's unmatchable.
+                    continue
+
+                expr = fields.as_expression(field, value)
+                if expr.evaluate(type_.metadata_doc):
+                    remaining_matchable.pop(key)
+                else:
+                    # A property doesn't match this type, skip to next type.
                     break
 
-                try:
-                    if all(expr.evaluate(type_.metadata_doc) for expr in exprs):
-                        q.pop(key)
-                    else:
-                        break
-                except (AttributeError, KeyError, ValueError) as e:
-                    continue
             else:
-                yield type_, q
+                yield type_, remaining_matchable
 
     def get_all(self):
+        # type: () -> Iterable[DatasetType]
         """
         Retrieve all Products
 
@@ -533,13 +554,13 @@ class ProductResource(object):
 
 class DatasetResource(object):
     """
-    :type _db: datacube.index.postgres._api.PostgresDb
+    :type _db: datacube.index.postgres._connections.PostgresDb
     :type types: datacube.index._datasets.ProductResource
     """
 
     def __init__(self, db, dataset_type_resource):
         """
-        :type db: datacube.index.postgres._api.PostgresDb
+        :type db: datacube.index.postgres._connections.PostgresDb
         :type dataset_type_resource: datacube.index._datasets.ProductResource
         """
         self._db = db
@@ -549,10 +570,13 @@ class DatasetResource(object):
         """
         Get dataset by id
 
-        :param uuid id_: id of the dataset to retrieve
+        :param UUID id_: id of the dataset to retrieve
         :param bool include_sources: get the full provenance graph?
         :rtype: datacube.model.Dataset
         """
+        if isinstance(id_, compat.string_types):
+            id_ = UUID(id_)
+
         with self._db.connect() as connection:
             if not include_sources:
                 dataset = connection.get_dataset(id_)
@@ -567,11 +591,11 @@ class DatasetResource(object):
 
         for dataset, result in datasets.values():
             dataset.metadata_doc['lineage']['source_datasets'] = {
-                classifier: datasets[str(source)][0].metadata_doc
+                classifier: datasets[source][0].metadata_doc
                 for source, classifier in zip(result['sources'], result['classes']) if source
                 }
             dataset.sources = {
-                classifier: datasets[str(source)][0]
+                classifier: datasets[source][0]
                 for source, classifier in zip(result['sources'], result['classes']) if source
                 }
         return datasets[id_][0]
@@ -580,7 +604,7 @@ class DatasetResource(object):
         """
         Get all derived datasets
 
-        :param uuid id_: dataset id
+        :param UUID id_: dataset id
         :rtype: list[datacube.model.Dataset]
         """
         with self._db.connect() as connection:
@@ -591,48 +615,32 @@ class DatasetResource(object):
         """
         Have we already indexed this dataset?
 
-        :param uuid id_: dataset id
+        :param typing.Union[UUID, str] id_: dataset id
         :rtype: bool
         """
         with self._db.connect() as connection:
             return connection.contains_dataset(id_)
 
-    def add(self, dataset, skip_sources=False):
+    def add(self, dataset, skip_sources=False, sources_policy='verify'):
         """
         Ensure a dataset is in the index. Add it if not present.
 
         :param datacube.model.Dataset dataset: dataset to add
-        :param bool skip_sources: don't attempt to index source (use when sources are already indexed)
+        :param str sources_policy: one of 'verify' - verify the metadata, 'ensure' - add if doesn't exist, 'skip' - skip
+        :param bool skip_sources: don't attempt to index source datasets (use when sources are already indexed)
         :rtype: datacube.model.Dataset
         """
-        if not skip_sources:
-            for source in dataset.sources.values():
-                self.add(source)
+        if skip_sources:
+            warnings.warn('"skip_sources" is deprecated, use "sources_policy"', DeprecationWarning)
+            sources_policy = 'skip'
+        self._add_sources(dataset, sources_policy)
 
-        was_inserted = False
         sources_tmp = dataset.type.dataset_reader(dataset.metadata_doc).sources
         dataset.type.dataset_reader(dataset.metadata_doc).sources = {}
         try:
             _LOG.info('Indexing %s', dataset.id)
-            product = self.types.get_by_name(dataset.type.name)
-            if product is None:
-                _LOG.warning('Adding product "%s" as it doesn\'t exist.', dataset.type.name)
-                product = self.types.add(dataset.type)
-            with self._db.begin() as transaction:
-                try:
-                    was_inserted = transaction.insert_dataset(dataset.metadata_doc, dataset.id, product.id)
-                    for classifier, source_dataset in dataset.sources.items():
-                        transaction.insert_dataset_source(classifier, dataset.id, source_dataset.id)
 
-                    # try to update location in the same transaction as insertion.
-                    # if insertion fails we'll try updating location later
-                    # if insertion succeeds the location bit can't possibly fail
-                    if dataset.local_uri:
-                        transaction.ensure_dataset_location(dataset.id, dataset.local_uri)
-                except DuplicateRecordError as e:
-                    _LOG.warning(str(e))
-
-            if not was_inserted:
+            if not self._try_add(dataset):
                 existing = self.get(dataset.id)
                 if existing:
                     check_doc_unchanged(
@@ -652,6 +660,48 @@ class DatasetResource(object):
             dataset.type.dataset_reader(dataset.metadata_doc).sources = sources_tmp
 
         return dataset
+
+    def search_product_duplicates(self, product, *group_fields):
+        # type: (DatasetType, Iterable[Union[str, Field]]) -> Iterable[tuple, Set[UUID]]
+        """
+        Find dataset ids who have duplicates of the given set of field names.
+
+        Product is always inserted as the first grouping field.
+
+        Returns each set of those field values and the datasets that have them.
+        """
+
+        def load_field(f):
+            # type: (Union[str, Field]) -> Field
+            if isinstance(f, compat.string_types):
+                return product.metadata_type.dataset_fields[f]
+            assert isinstance(f, Field), "Not a field: %r" % (f,)
+            return f
+
+        group_fields = [load_field(f) for f in group_fields]
+        result_type = namedtuple('search_result', (f.name for f in group_fields))
+
+        expressions = [product.metadata_type.dataset_fields.get('product') == product.name]
+
+        with self._db.connect() as connection:
+            for record in connection.get_duplicates(group_fields, expressions):
+                dataset_ids = set(record[0])
+                grouped_fields = tuple(record[1:])
+                yield result_type(*grouped_fields), dataset_ids
+
+    def _add_sources(self, dataset, sources_policy='verify'):
+        if dataset.sources is None:
+            raise ValueError("Dataset has missing (None) sources. Was this loaded without include_sources=True?")
+
+        if sources_policy == 'ensure':
+            for source in dataset.sources.values():
+                if not self.has(source.id):
+                    self.add(source, sources_policy=sources_policy)
+        elif sources_policy == 'verify':
+            for source in dataset.sources.values():
+                self.add(source, sources_policy=sources_policy)
+        elif sources_policy != 'skip':
+            raise ValueError('sources_policy must be one of ("verify", "ensure", "skip")')
 
     def can_update(self, dataset, updates_allowed=None):
         """
@@ -730,7 +780,7 @@ class DatasetResource(object):
         """
         Mark datasets as archived
 
-        :param list[uuid] ids: list of dataset ids to archive
+        :param list[UUID] ids: list of dataset ids to archive
         """
         with self._db.begin() as transaction:
             for id_ in ids:
@@ -740,7 +790,7 @@ class DatasetResource(object):
         """
         Mark datasets as not archived
 
-        :param list[uuid] ids: list of dataset ids to restore
+        :param list[UUID] ids: list of dataset ids to restore
         """
         with self._db.begin() as transaction:
             for id_ in ids:
@@ -771,19 +821,28 @@ class DatasetResource(object):
 
     def add_location(self, dataset, uri):
         """
-        Add a location to the dataset.
+        Add a location to the dataset if it doesn't already exist.
         :param datacube.model.Dataset dataset: dataset
         :param str uri: fully qualified uri
+        :returns bool: Was one added?
         """
         with self._db.connect() as connection:
-            return connection.ensure_dataset_location(dataset.id, uri)
+            try:
+                connection.ensure_dataset_location(dataset.id, uri)
+                return True
+            except DuplicateRecordError:
+                return False
+
+    def get_datasets_for_location(self, uri):
+        with self._db.connect() as connection:
+            return (self._make(row) for row in connection.get_datasets_for_location(uri))
 
     def remove_location(self, dataset, uri):
         """
         Remove a location from the dataset if it exists.
         :param datacube.model.Dataset dataset: dataset
         :param str uri: fully qualified uri
-        :returns: True if a matching one was found
+        :returns bool: Was one removed?
         """
         with self._db.connect() as connection:
             was_removed = connection.remove_location(dataset.id, uri)
@@ -795,10 +854,12 @@ class DatasetResource(object):
 
         :param bool full_info: Include all available fields
         """
+        uri = dataset_res.uri
         return Dataset(
             self.types.get(dataset_res.dataset_type_ref),
             dataset_res.metadata,
-            dataset_res.local_uri,
+            # We guarantee that this property on the class is only a local uri.
+            uri if uri and uri.startswith('file:') else None,
             indexed_by=dataset_res.added_by if full_info else None,
             indexed_time=dataset_res.added if full_info else None,
             archived_time=dataset_res.archived
@@ -844,6 +905,27 @@ class DatasetResource(object):
         """
         for product, datasets in self._do_search_by_product(query):
             yield product, self._make_many(datasets)
+
+    def search_returning(self, field_names, **query):
+        """
+        Perform a search, returning only the specified fields.
+
+        This method can be faster than normal search() if you don't need all fields of each dataset.
+
+        It also allows for returning rows other than datasets, such as a row per uri when requesting field 'uri'.
+
+        :param tuple[str] field_names:
+        :param dict[str,str|float|datacube.model.Range] query:
+        :returns __generator[tuple]: sequence of results, each result is a namedtuple of your requested fields
+        """
+        result_type = namedtuple('search_result', field_names)
+
+        for _, results in self._do_search_by_product(query,
+                                                     return_fields=True,
+                                                     select_field_names=field_names):
+
+            for columns in results:
+                yield result_type(*columns)
 
     def count(self, **query):
         """
@@ -895,6 +977,32 @@ class DatasetResource(object):
         """
         return next(self._do_time_count(period, query, ensure_single=True))[1]
 
+    def _try_add(self, dataset):
+        was_inserted = False
+
+        product = self.types.get_by_name(dataset.type.name)
+        if product is None:
+            _LOG.warning('Adding product "%s" as it doesn\'t exist.', dataset.type.name)
+            product = self.types.add(dataset.type)
+        if dataset.sources is None:
+            raise ValueError("Dataset has missing (None) sources. Was this loaded without include_sources=True?")
+
+        with self._db.begin() as transaction:
+            try:
+                was_inserted = transaction.insert_dataset(dataset.metadata_doc, dataset.id, product.id)
+
+                for classifier, source_dataset in dataset.sources.items():
+                    transaction.insert_dataset_source(classifier, dataset.id, source_dataset.id)
+
+                # try to update location in the same transaction as insertion.
+                # if insertion fails we'll try updating location later
+                # if insertion succeeds the location bit can't possibly fail
+                if dataset.local_uri:
+                    transaction.ensure_dataset_location(dataset.id, dataset.local_uri)
+            except DuplicateRecordError as e:
+                _LOG.warning(str(e))
+        return was_inserted
+
     def _get_dataset_types(self, q):
         types = set()
         if 'product' in q.keys():
@@ -912,11 +1020,17 @@ class DatasetResource(object):
             q['dataset_type_id'] = product.id
             yield q, product
 
-    def _do_search_by_product(self, query, return_fields=False, with_source_ids=False, source_filter=None):
+    def _do_search_by_product(self, query, return_fields=False, select_field_names=None,
+                              with_source_ids=False, source_filter=None):
         if source_filter:
             product_queries = list(self._get_product_queries(source_filter))
-            if len(product_queries) != 1:
+            if not product_queries:
+                # No products match our source filter, so there will be no search results regardless.
+                _LOG.info("No products match source filter")
+                return
+            if len(product_queries) > 1:
                 raise RuntimeError("Multi-product source filters are not supported. Try adding 'product' field")
+
             source_queries, source_product = product_queries[0]
             dataset_fields = source_product.metadata_type.dataset_fields
             source_exprs = tuple(fields.to_expressions(dataset_fields.get, **source_queries))
@@ -930,7 +1044,13 @@ class DatasetResource(object):
                 query_exprs = tuple(fields.to_expressions(dataset_fields.get, **q))
                 select_fields = None
                 if return_fields:
-                    select_fields = tuple(dataset_fields.values())
+                    # if no fields specified, select all
+                    if select_field_names is None:
+                        select_fields = tuple(field for name, field in dataset_fields.items()
+                                              if not field.affects_row_selection)
+                    else:
+                        select_fields = tuple(dataset_fields[field_name]
+                                              for field_name in select_field_names)
                 yield (product,
                        connection.search_datasets(
                            query_exprs,
@@ -983,7 +1103,7 @@ class DatasetResource(object):
         Perform a search, returning just the search fields of each dataset.
 
         :param dict[str,str|float|datacube.model.Range] query:
-        :rtype: dict
+        :rtype: __generator[dict]
         """
         for _, results in self._do_search_by_product(query, return_fields=True):
             for columns in results:

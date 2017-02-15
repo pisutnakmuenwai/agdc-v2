@@ -141,7 +141,7 @@ def load_config_from_file(index, config):
 def create_task_list(index, output_type, year, source_type, config):
     query = {}
     if year:
-        query['time'] = Range(datetime(year=year, month=1, day=1), datetime(year=year + 1, month=1, day=1))
+        query['time'] = Range(datetime(year=year[0], month=1, day=1), datetime(year=year[1] + 1, month=1, day=1))
     if 'ingestion_bounds' in config:
         bounds = config['ingestion_bounds']
         query['x'] = Range(bounds['left'], bounds['right'])
@@ -208,7 +208,7 @@ def _index_datasets(index, results, skip_sources):
     n = 0
     for datasets in results:
         for dataset in datasets.values:
-            index.datasets.add(dataset, skip_sources=skip_sources)
+            index.datasets.add(dataset, sources_policy='skip')
             n += 1
     return n
 
@@ -257,11 +257,24 @@ def process_tasks(index, config, source_type, output_type, tasks, queue_size, ex
     return n_successful, n_failed
 
 
+def _validate_year(ctx, param, value):
+    try:
+        if value is None:
+            return None
+        years = list(map(int, value.split('-', 2)))
+        if len(years) == 1:
+            return years[0], years[0]
+        return tuple(years)
+    except ValueError:
+        raise click.BadParameter('year must be specified as a single year (eg 1996) '
+                                 'or as an inclusive range (eg 1996-2001)')
+
+
 @cli.command('ingest', help="Ingest datasets")
 @click.option('--config-file', '-c',
               type=click.Path(exists=True, readable=True, writable=False, dir_okay=False),
               help='Ingest configuration file')
-@click.option('--year', type=click.IntRange(1960, 2060))
+@click.option('--year', callback=_validate_year, help='Limit the process to a particular year')
 @click.option('--queue-size', type=click.IntRange(1, 100000), default=3200, help='Task queue size')
 @click.option('--save-tasks', help='Save tasks to the specified file',
               type=click.Path(exists=False))

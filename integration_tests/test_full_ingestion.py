@@ -13,8 +13,7 @@ from affine import Affine
 from datacube.api.query import query_group_by
 
 import datacube.scripts.cli_app
-from datacube.model import GeoBox, CRS
-from datacube.utils import read_documents
+from datacube.utils import geometry, read_documents
 from .conftest import EXAMPLE_LS5_DATASET_ID
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -38,8 +37,8 @@ COMPLIANCE_CHECKER_NORMAL_LIMIT = 2
 
 
 @pytest.mark.usefixtures('default_metadata_type',
-                         'indexed_ls5_scene_dataset_type')
-def test_full_ingestion(global_integration_cli_args, index, example_ls5_dataset, ls5_nbar_ingest_config):
+                         'indexed_ls5_scene_dataset_types')
+def test_full_ingestion(global_integration_cli_args, index, example_ls5_dataset_path, ls5_nbar_ingest_config):
     opts = list(global_integration_cli_args)
     opts.extend(
         [
@@ -47,7 +46,7 @@ def test_full_ingestion(global_integration_cli_args, index, example_ls5_dataset,
             'dataset',
             'add',
             '--auto-match',
-            str(example_ls5_dataset)
+            str(example_ls5_dataset_path)
         ]
     )
     result = CliRunner().invoke(
@@ -90,7 +89,7 @@ def test_full_ingestion(global_integration_cli_args, index, example_ls5_dataset,
         check_data_shape(nco)
         check_grid_mapping(nco)
         check_cf_compliance(nco)
-        check_dataset_metadata_in_storage_unit(nco, example_ls5_dataset)
+        check_dataset_metadata_in_storage_unit(nco, example_ls5_dataset_path)
         check_attributes(nco, config['global_attributes'])
 
         name = config['measurements'][0]['name']
@@ -172,7 +171,7 @@ def check_open_with_api(index):
     input_type_name = 'ls5_nbar_albers'
     input_type = dc.index.products.get_by_name(input_type_name)
 
-    geobox = GeoBox(200, 200, Affine(25, 0.0, 1500000, 0.0, -25, -3900000), CRS('EPSG:3577'))
+    geobox = geometry.GeoBox(200, 200, Affine(25, 0.0, 1500000, 0.0, -25, -3900000), geometry.CRS('EPSG:3577'))
     observations = dc.find_datasets(product='ls5_nbar_albers', geopolygon=geobox.extent)
     group_by = query_group_by('time')
     sources = dc.group_datasets(observations, group_by)

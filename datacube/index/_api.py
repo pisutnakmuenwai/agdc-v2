@@ -18,6 +18,7 @@ _DEFAULT_METADATA_TYPES_PATH = Path(__file__).parent.joinpath('default-metadata-
 
 
 def connect(local_config=None, application_name=None, validate_connection=True):
+    # type: (LocalConfig, str, bool) -> Index
     """
     Connect to the index. Default Postgres implementation.
 
@@ -25,8 +26,8 @@ def connect(local_config=None, application_name=None, validate_connection=True):
     :param local_config: Config object to use.
     :type local_config: :py:class:`datacube.config.LocalConfig`, optional
     :param validate_connection: Validate database connection and schema immediately
-    :rtype: Index
     :raises datacube.index.postgres._api.EnvironmentError:
+    :rtype: Index
     """
     if local_config is None:
         local_config = LocalConfig.find()

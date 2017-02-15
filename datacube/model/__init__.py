@@ -9,18 +9,20 @@ import math
 import warnings
 from collections import namedtuple, OrderedDict, Sequence
 from pathlib import Path
+from uuid import UUID
 
-import numpy
 from affine import Affine
 
-from datacube.utils import parse_time, cached_property, uri_to_local_path, intersects, schema_validated, DocReader
 from datacube.utils import geometry
-from datacube.utils.geometry import CRS, BoundingBox
+from datacube.utils import parse_time, cached_property, uri_to_local_path, intersects, schema_validated, DocReader
+from datacube.utils.geometry import (CRS as _CRS,
+                                     GeoBox as _GeoBox,
+                                     Coordinate as _Coordinate,
+                                     BoundingBox as _BoundingBox)
 
 _LOG = logging.getLogger(__name__)
 
 Range = namedtuple('Range', ('begin', 'end'))
-Coordinate = namedtuple('Coordinate', ('values', 'units'))
 Variable = namedtuple('Variable', ('dtype', 'nodata', 'dims', 'units'))
 CellIndex = namedtuple('CellIndex', ('x', 'y'))
 
@@ -30,17 +32,36 @@ VALID_VARIABLE_ATTRS = {'standard_name', 'long_name', 'units', 'flags_definition
 SCHEMA_PATH = Path(__file__).parent / 'schema'
 
 
-def _round_to_res(value, res, acc=0.1):
-    """
-    >>> _round_to_res(0.2, 1.0)
-    1
-    >>> _round_to_res(0.0, 1.0)
-    0
-    >>> _round_to_res(0.05, 1.0)
-    0
-    """
-    res = abs(res)
-    return int(math.ceil((value - 0.1 * res) / res))
+class CRS(_CRS):
+    def __init__(self, *args, **kwargs):
+        warnings.warn("The 'CRS' class has been renamed to 'datacube.utils.geometry.CRS' and will be "
+                      "removed from 'datacube.model'. Please update your code.",
+                      DeprecationWarning)
+        super(CRS, self).__init__(*args, **kwargs)
+
+
+class GeoBox(_GeoBox):
+    def __init__(self, *args, **kwargs):
+        warnings.warn("The 'GeoBox' class has been renamed to 'datacube.utils.geometry.GeoBox' and will be "
+                      "removed from 'datacube.model'. Please update your code.",
+                      DeprecationWarning)
+        super(GeoBox, self).__init__(*args, **kwargs)
+
+
+class Coordinate(_Coordinate):
+    def __init__(self, *args, **kwargs):
+        warnings.warn("The 'Coordinate' class has been renamed to 'datacube.utils.geometry.Coordinate' and will be "
+                      "removed from 'datacube.model'. Please update your code.",
+                      DeprecationWarning)
+        super(Coordinate, self).__init__(*args, **kwargs)
+
+
+class BoundingBox(_BoundingBox):  # pylint: disable=duplicate-bases
+    def __init__(self, *args, **kwargs):
+        warnings.warn("The 'BoundingBox' class has been renamed to 'datacube.utils.geometry.BoundingBox' and will be "
+                      "removed from 'datacube.model'. Please update your code.",
+                      DeprecationWarning)
+        super(BoundingBox, self).__init__(*args, **kwargs)
 
 
 class Dataset(object):
@@ -66,15 +87,18 @@ class Dataset(object):
         #: :type: dict
         self.metadata_doc = metadata_doc
 
-        #: The local file or path that can be opened to access the raw data.
+        #: The most recent local file available to access the data, if any.
+        #: Note that a dataset can have multiple uris, not all of which are local files.
+        #: To get all uris for a dataset, use index.datasets.get_locations()
         #: :type: str
         self.local_uri = local_uri
 
-        #: The datasets that this dataset is derived from.
+        #: The datasets that this dataset is derived from (if requested on load).
         #: :type: dict[str, Dataset]
-        self.sources = sources or {}
+        self.sources = sources
 
-        assert set(self.metadata.sources.keys()) == set(self.sources.keys())
+        if sources is not None:
+            assert set(self.metadata.sources.keys()) == set(self.sources.keys())
 
         #: The User who indexed this dataset
         #: :type: str
@@ -103,9 +127,10 @@ class Dataset(object):
     @property
     def id(self):
         """
-        :rtype: uuid
+        :rtype: UUID
         """
-        return self.metadata.id
+        # This is a string in a raw document.
+        return UUID(self.metadata.id)
 
     @property
     def managed(self):
@@ -139,32 +164,53 @@ class Dataset(object):
     @property
     def bounds(self):
         """
-        :rtype: rasterio.coords.BoundingBox
+        :rtype: geometry.BoundingBox
         """
         bounds = self.metadata.grid_spatial['geo_ref_points']
-        return BoundingBox(left=bounds['ul']['x'], right=bounds['lr']['x'],
-                           top=bounds['ul']['y'], bottom=bounds['lr']['y'])
+        return geometry.BoundingBox(left=min(bounds['ur']['x'], bounds['ll']['x']),
+                                    right=max(bounds['ur']['x'], bounds['ll']['x']),
+                                    top=max(bounds['ur']['y'], bounds['ll']['y']),
+                                    bottom=min(bounds['ur']['y'], bounds['ll']['y']))
+
+    @property
+    def transform(self):
+        bounds = self.metadata.grid_spatial['geo_ref_points']
+        return Affine(bounds['lr']['x'] - bounds['ul']['x'], 0, bounds['ul']['x'],
+                      0, bounds['lr']['y'] - bounds['ul']['y'], bounds['ul']['y'])
+
+    @property
+    def is_archived(self):
+        """
+        Is this dataset archived?
+
+        (an archived dataset is one that is not intended to be used by users anymore: eg. it has been
+        replaced by another dataset. It will not show up in search results, but still exists in the
+        system via provenance chains or through id lookup.)
+
+        :rtype: bool
+        """
+        return self.archived_time is not None
 
     @property
     def crs(self):
         """
-        :rtype: CRS
+        :rtype: geometry.CRS
         """
         projection = self.metadata.grid_spatial
 
         crs = projection.get('spatial_reference', None)
         if crs:
-            return CRS(str(crs))
+            return geometry.CRS(str(crs))
 
         # TODO: really need CRS specified properly in agdc-metadata.yaml
         if projection['datum'] == 'GDA94':
-            return CRS('EPSG:283' + str(abs(projection['zone'])))
+            return geometry.CRS('EPSG:283' + str(abs(projection['zone'])))
 
         if projection['datum'] == 'WGS84':
             if projection['zone'][-1] == 'S':
-                return CRS('EPSG:327' + str(abs(int(projection['zone'][:-1]))))
+                return geometry.CRS('EPSG:327' + str(abs(int(projection['zone'][:-1]))))
             else:
-                return CRS('EPSG:326' + str(abs(int(projection['zone'][:-1]))))
+                return geometry.CRS('EPSG:326' + str(abs(int(projection['zone'][:-1]))))
 
         raise RuntimeError('Cant figure out the projection: %s %s' % (projection['datum'], projection['zone']))
 
@@ -227,7 +273,7 @@ class MetadataType(object):
         #: :type: dict
         self.definition = definition
 
-        #: :rtype: dict[str,datacube.index.fields.Field]
+        #: :type: dict[str,datacube.index.fields.Field]
         self.dataset_fields = dataset_search_fields
 
         #: :type: int
@@ -241,12 +287,8 @@ class MetadataType(object):
     def description(self):
         return self.definition['description']
 
-    @property
-    def dataset_offsets(self):
-        return self.definition['dataset']
-
     def dataset_reader(self, dataset_doc):
-        return DocReader(self.dataset_offsets, self.dataset_fields, dataset_doc)
+        return DocReader(self.definition['dataset'], self.dataset_fields, dataset_doc)
 
     def __str__(self):
         return "MetadataType(name={name!r}, id_={id!r})".format(id=self.id, name=self.name)
@@ -334,7 +376,7 @@ class DatasetType(object):
 
         if 'crs' not in storage:
             return None
-        crs = CRS(str(storage['crs']).strip())
+        crs = geometry.CRS(str(storage['crs']).strip())
 
         tile_size = None
         if 'tile_size' in storage:
@@ -387,7 +429,7 @@ class DatasetType(object):
 
 
 def GeoPolygon(coordinates, crs):  # pylint: disable=invalid-name
-    warnings.warn("GeoPolygon is depricated. Use datacube.utils.geometry.polygon", DeprecationWarning)
+    warnings.warn("GeoPolygon is depricated. Use 'datacube.utils.geometry.polygon'", DeprecationWarning)
     if not isinstance(coordinates, Sequence):
         raise ValueError("points ({}) must be a sequence of (x, y) coordinates".format(coordinates))
     return geometry.polygon(coordinates + [coordinates[0]], crs=crs)
@@ -402,6 +444,8 @@ def _polygon_from_boundingbox(boundingbox, crs=None):
         (boundingbox.left, boundingbox.top),
     ]
     return geometry.polygon(points, crs=crs)
+
+
 GeoPolygon.from_boundingbox = _polygon_from_boundingbox
 
 
@@ -409,6 +453,8 @@ def _polygon_from_sources_extents(sources, geobox):
     sources_union = geometry.unary_union(source.extent.to_crs(geobox.crs) for source in sources)
     valid_data = geobox.extent.intersection(sources_union)
     return valid_data
+
+
 GeoPolygon.from_sources_extents = _polygon_from_sources_extents
 
 
@@ -426,17 +472,17 @@ class GridSpec(object):
     """
     Definition for a regular spatial grid
 
-    >>> gs = GridSpec(crs=CRS('EPSG:4326'), tile_size=(1, 1), resolution=(-0.1, 0.1), origin=(-50.05, 139.95))
+    >>> gs = GridSpec(crs=geometry.CRS('EPSG:4326'), tile_size=(1, 1), resolution=(-0.1, 0.1), origin=(-50.05, 139.95))
     >>> gs.tile_resolution
     (10, 10)
-    >>> list(gs.tiles(BoundingBox(140, -50, 141.5, -48.5)))
+    >>> list(gs.tiles(geometry.BoundingBox(140, -50, 141.5, -48.5)))
     [((0, 0), GeoBox(10, 10, Affine(0.1, 0.0, 139.95,
            0.0, -0.1, -49.05), EPSG:4326)), ((1, 0), GeoBox(10, 10, Affine(0.1, 0.0, 140.95,
            0.0, -0.1, -49.05), EPSG:4326)), ((0, 1), GeoBox(10, 10, Affine(0.1, 0.0, 139.95,
            0.0, -0.1, -48.05), EPSG:4326)), ((1, 1), GeoBox(10, 10, Affine(0.1, 0.0, 140.95,
            0.0, -0.1, -48.05), EPSG:4326))]
 
-    :param CRS crs: Coordinate System used to define the grid
+    :param geometry.CRS crs: Coordinate System used to define the grid
     :param [float,float] tile_size: (Y, X) size of each tile, in CRS units
     :param [float,float] resolution: (Y, X) size of each data point in the grid, in CRS units. Y will
                                    usually be negative.
@@ -444,7 +490,7 @@ class GridSpec(object):
     """
 
     def __init__(self, crs, tile_size, resolution, origin=None):
-        #: :rtype: CRS
+        #: :rtype: geometry.CRS
         self.crs = crs
         #: :type: (float,float)
         self.tile_size = tile_size
@@ -499,12 +545,12 @@ class GridSpec(object):
         Tile geobox.
 
         :param (int,int) tile_index:
-        :rtype: GeoBox
+        :rtype: datacube.utils.geometry.GeoBox
         """
         res_y, res_x = self.resolution
         y, x = self.tile_coords(tile_index)
         h, w = self.tile_resolution
-        geobox = GeoBox(crs=self.crs, affine=Affine(res_x, 0.0, x, 0.0, res_y, y), width=w, height=h)
+        geobox = geometry.GeoBox(crs=self.crs, affine=Affine(res_x, 0.0, x, 0.0, res_y, y), width=w, height=h)
         return geobox
 
     def tiles(self, bounds):
@@ -584,171 +630,3 @@ class GridSpec(object):
 
     def __repr__(self):
         return self.__str__()
-
-
-class GeoBox(object):
-    """
-    Defines the location and resolution of a rectangular grid of data,
-    including it's :py:class:`CRS`.
-
-    >>> from affine import Affine
-    >>> t = GeoBox(4000, 4000, Affine(0.00025, 0.0, 151.0, 0.0, -0.00025, -29.0), CRS('EPSG:4326'))
-    >>> t.coordinates['latitude'].values
-    array([-29.000125, -29.000375, -29.000625, ..., -29.999375, -29.999625,
-           -29.999875])
-    >>> t.coordinates['longitude'].values
-    array([ 151.000125,  151.000375,  151.000625, ...,  151.999375,
-            151.999625,  151.999875])
-    >>> t.resolution
-    (-0.00025, 0.00025)
-
-
-    :param CRS crs: Coordinate Reference System
-    :param affine.Affine affine: Affine transformation defining the location of the geobox
-    """
-
-    def __init__(self, width, height, affine, crs):
-        assert height > 0 and width > 0, "Can't create GeoBox of zero size"
-        #: :type: int
-        self.width = width
-        #: :type: int
-        self.height = height
-        #: :rtype: affine.Affine
-        self.affine = affine
-
-        points = [(0, 0), (0, height), (width, height), (width, 0), (0, 0)]
-        self.affine.itransform(points)
-        #: :rtype: geometry.Geometry
-        self.extent = geometry.polygon(points, crs=crs)
-
-    @classmethod
-    def from_geopolygon(cls, geopolygon, resolution, crs=None, align=None):
-        """
-        :type geopolygon: geometry.Geometry
-        :param resolution: (y_resolution, x_resolution)
-        :param CRS crs: CRS to use, if different from the geopolygon
-        :param (float,float) align: Align geobox such that point 'align' lies on the pixel boundary.
-        :rtype: GeoBox
-        """
-        # TODO: currently only flipped Y-axis data is supported
-
-        assert resolution[1] > 0, "decreasing X coordinates are not supported"
-        assert resolution[0] < 0, "increasing Y coordinates are not supported"
-
-        align = align or (0.0, 0.0)
-        assert 0.0 <= align[1] <= abs(resolution[1]), "X align must be in [0, abs(x_resolution)] range"
-        assert 0.0 <= align[0] <= abs(resolution[0]), "Y align must be in [0, abs(y_resolution)] range"
-
-        if crs is None:
-            crs = geopolygon.crs
-        else:
-            geopolygon = geopolygon.to_crs(crs)
-
-        def align_pix(val, res, off):
-            return math.floor((val - off) / res) * res + off
-
-        bounding_box = geopolygon.boundingbox
-        left = align_pix(bounding_box.left, resolution[1], align[1])
-        top = align_pix(bounding_box.top, resolution[0], align[0])
-        affine = (Affine.translation(left, top) * Affine.scale(resolution[1], resolution[0]))
-        return GeoBox(crs=crs,
-                      affine=affine,
-                      width=max(1, int(math.ceil((bounding_box.right - left - 0.1 * resolution[1]) / resolution[1]))),
-                      height=max(1, int(math.ceil((bounding_box.bottom - top - 0.1 * resolution[0]) / resolution[0]))))
-
-    def buffered(self, ybuff, xbuff):
-        """
-        Produce a tile buffered by ybuff, xbuff (in CRS units)
-        """
-        w, h = (_round_to_res(buf, res) for buf, res in zip((ybuff, xbuff), self.resolution))
-        return self[-h:self.height+h, -w:self.width+w]
-
-    def __getitem__(self, item):
-        indexes = [slice(index.start or 0, index.stop or size, index.step or 1)
-                   for size, index in zip(self.shape, item)]
-        for index in indexes:
-            if index.step != 1:
-                raise NotImplementedError('scaling not implemented, yet')
-
-        affine = self.affine * Affine.translation(indexes[1].start, indexes[0].start)
-        return GeoBox(width=indexes[1].stop - indexes[1].start,
-                      height=indexes[0].stop - indexes[0].start,
-                      affine=affine,
-                      crs=self.crs)
-
-    @property
-    def shape(self):
-        """
-        :type: (int,int)
-        """
-        return self.height, self.width
-
-    @property
-    def crs(self):
-        """
-        :rtype: CRS
-        """
-        return self.extent.crs
-
-    @property
-    def dimensions(self):
-        """
-        List of dimension names of the GeoBox
-
-        :type: (str,str)
-        """
-        return self.crs.dimensions
-
-    @property
-    def resolution(self):
-        """
-        Resolution in Y,X dimensions
-
-        :type: (float,float)
-        """
-        return self.affine.e, self.affine.a
-
-    @property
-    def alignment(self):
-        """
-        Alignment of pixel boundaries in Y,X dimensions
-
-        :type: (float,float)
-        """
-        return self.affine.yoff % abs(self.affine.e), self.affine.xoff % abs(self.affine.a)
-
-    @property
-    def coordinates(self):
-        """
-        dict of coordinate labels
-
-        :type: dict[str,numpy.array]
-        """
-        xs = numpy.arange(self.width) * self.affine.a + (self.affine.c + self.affine.a / 2)
-        ys = numpy.arange(self.height) * self.affine.e + (self.affine.f + self.affine.e / 2)
-
-        return OrderedDict((dim, Coordinate(labels, units)) for dim, labels, units in zip(self.crs.dimensions,
-                                                                                          (ys, xs), self.crs.units))
-
-    @property
-    def geographic_extent(self):
-        """
-        :rtype: geometry.Geometry
-        """
-        if self.crs.geographic:
-            return self.extent
-        return self.extent.to_crs(CRS('EPSG:4326'))
-
-    coords = coordinates
-    dims = dimensions
-
-    def __str__(self):
-        return "GeoBox({})".format(self.geographic_extent.points)
-
-    def __repr__(self):
-        return "GeoBox({width}, {height}, {affine!r}, {crs})".format(
-            width=self.width,
-            height=self.height,
-            affine=self.affine,
-            crs=self.extent.crs
-        )

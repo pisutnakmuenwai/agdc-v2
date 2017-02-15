@@ -1,22 +1,38 @@
 from __future__ import absolute_import
 
+import csv
+import datetime
 import logging
 import sys
-
-import csv
-import click
-from click import echo
-import datetime
-import yaml
+from collections import OrderedDict
+from decimal import Decimal
 from pathlib import Path
 
+import click
+import yaml
+import yaml.resolver
+from click import echo
+from yaml import Node
+
+from datacube.index._api import Index
+from datacube.index.exceptions import MissingRecordError
 from datacube.model import Dataset
+from datacube.model import Range
 from datacube.ui import click as ui
 from datacube.ui.click import cli
 from datacube.ui.common import get_metadata_path
-from datacube.utils import read_documents, changes
+from datacube.utils import read_documents, changes, InvalidDocException
+
+try:
+    from typing import Iterable
+except ImportError:
+    pass
 
 _LOG = logging.getLogger('datacube-dataset')
+
+
+class BadMatch(Exception):
+    pass
 
 
 @cli.group(name='dataset', help='Dataset management commands')
@@ -28,9 +44,9 @@ def find_matching_product(rules, doc):
     """:rtype: datacube.model.DatasetType"""
     matched = [rule for rule in rules if changes.contains(doc, rule['metadata'])]
     if not matched:
-        raise RuntimeError('No matching Product found for %s' % doc.get('id', 'unidentified'))
+        raise BadMatch('No matching Product found for %s' % doc.get('id', 'unidentified'))
     if len(matched) > 1:
-        raise RuntimeError('Too many matching Products found for %s. Matched %s.' % (
+        raise BadMatch('Too many matching Products found for %s. Matched %s.' % (
             doc.get('id', 'unidentified'), matched))
     return matched[0]['type']
 
@@ -98,22 +114,25 @@ def load_datasets(datasets, rules):
             _LOG.error('No supported metadata docs found for dataset %s', dataset_path)
             continue
 
-        for metadata_path, metadata_doc in read_documents(metadata_path):
-            uri = metadata_path.absolute().as_uri()
+        try:
+            for metadata_path, metadata_doc in read_documents(metadata_path):
+                uri = metadata_path.absolute().as_uri()
 
-            try:
-                dataset = create_dataset(metadata_doc, uri, rules)
-            except RuntimeError as e:
-                _LOG.exception("Error creating dataset")
-                _LOG.error('Unable to create Dataset for %s: %s', uri, e)
-                continue
+                try:
+                    dataset = create_dataset(metadata_doc, uri, rules)
+                except BadMatch as e:
+                    _LOG.error('Unable to create Dataset for %s: %s', uri, e)
+                    continue
 
-            is_consistent, reason = check_dataset_consistent(dataset)
-            if not is_consistent:
-                _LOG.error("Dataset %s inconsistency: %s", dataset.id, reason)
-                continue
+                is_consistent, reason = check_dataset_consistent(dataset)
+                if not is_consistent:
+                    _LOG.error("Dataset %s inconsistency: %s", dataset.id, reason)
+                    continue
 
-            yield dataset
+                yield dataset
+        except InvalidDocException:
+            _LOG.error("Failed reading documents from %s", metadata_path)
+            continue
 
 
 def parse_match_rules_options(index, match_rules, dtype, auto_match):
@@ -134,20 +153,35 @@ def parse_match_rules_options(index, match_rules, dtype, auto_match):
               multiple=True)
 @click.option('--auto-match', '-a', help="Automatically associate datasets with products by matching metadata",
               is_flag=True, default=False)
+@click.option('--sources-policy', type=click.Choice(['verify', 'ensure', 'skip']), default='verify',
+              help="""'verify' - verify source datasets' metadata
+'ensure' - add source dataset if it doesn't exist
+'skip' - dont add the derived dataset if source dataset doesn't exist""")
 @click.option('--dry-run', help='Check if everything is ok', is_flag=True, default=False)
-@click.argument('datasets',
+@click.argument('dataset-paths',
                 type=click.Path(exists=True, readable=True, writable=False), nargs=-1)
 @ui.pass_index()
-def index_cmd(index, match_rules, dtype, auto_match, dry_run, datasets):
+def index_cmd(index, match_rules, dtype, auto_match, sources_policy, dry_run, dataset_paths):
     rules = parse_match_rules_options(index, match_rules, dtype, auto_match)
     if rules is None:
         return
 
-    with click.progressbar(load_datasets(datasets, rules), label='Indexing datasets') as loadable_datasets:
-        for dataset in loadable_datasets:
-            _LOG.info('Matched %s', dataset)
-            if not dry_run:
-                index.datasets.add(dataset)
+    # If outputting directly to terminal, show a progress bar.
+    if sys.stdout.isatty():
+        with click.progressbar(dataset_paths, label='Indexing datasets') as dataset_path_iter:
+            index_dataset_paths(sources_policy, dry_run, index, rules, dataset_path_iter)
+    else:
+        index_dataset_paths(sources_policy, dry_run, index, rules, dataset_paths)
+
+
+def index_dataset_paths(sources_policy, dry_run, index, rules, dataset_paths):
+    for dataset in load_datasets(dataset_paths, rules):
+        _LOG.info('Matched %s', dataset)
+        if not dry_run:
+            try:
+                index.datasets.add(dataset, sources_policy=sources_policy)
+            except (ValueError, MissingRecordError) as e:
+                _LOG.error('Failed to add dataset %s: %s', dataset.local_uri, e)
 
 
 def parse_update_rules(allow_any):
@@ -219,49 +253,143 @@ def update_dry_run(index, updates, dataset):
     return can_update
 
 
-def build_dataset_info(index, dataset, show_derived=False):
-    deriveds = []
-    if show_derived:
-        deriveds = index.datasets.get_derived(dataset.id)
+def build_dataset_info(index, dataset, show_sources=False, show_derived=False, depth=1, max_depth=99):
+    # type: (Index, Dataset, bool) -> dict
 
-    # def find_me(derived):
-    #     for key, source in derived.sources.items():
-    #         print(dataset.id, source.id)
-    #         if dataset.id == source.id:
-    #             return key
+    info = OrderedDict((
+        ('id', str(dataset.id)),
+        ('product', dataset.type.name),
+        ('status', 'archived' if dataset.is_archived else 'active')
+    ))
 
-    return {
-        'id': dataset.id,
-        'product': dataset.type.name,
-        'location': dataset.local_uri,
-        'sources': {key: build_dataset_info(index, source) for key, source in dataset.sources.items()},
-        'derived': [build_dataset_info(index, derived) for derived in deriveds]
-    }
+    # Optional when loading a dataset.
+    if dataset.indexed_time is not None:
+        info['indexed'] = dataset.indexed_time
+
+    info['locations'] = index.datasets.get_locations(dataset)
+    info['fields'] = dataset.metadata.search_fields
+
+    if depth < max_depth:
+        if show_sources:
+            info['sources'] = {key: build_dataset_info(index, source,
+                                                       show_sources=True, show_derived=False,
+                                                       depth=depth + 1, max_depth=max_depth)
+                               for key, source in dataset.sources.items()}
+
+        if show_derived:
+            info['derived'] = [build_dataset_info(index, derived,
+                                                  show_sources=False, show_derived=True,
+                                                  depth=depth + 1, max_depth=max_depth)
+                               for derived in index.datasets.get_derived(dataset.id)]
+
+    return info
 
 
-@dataset_cmd.command('info', help="Display dataset id, product, location and provenance")
-@click.option('--show-sources', help='Also show sources', is_flag=True, default=False)
-@click.option('--show-derived', help='Also show sources', is_flag=True, default=False)
+def _write_csv(infos):
+    writer = csv.DictWriter(sys.stdout, ['id', 'status', 'product', 'location'], extrasaction='ignore')
+    writer.writeheader()
+
+    def add_first_location(row):
+        locations_ = row['locations']
+        row['location'] = locations_[0] if locations_ else None
+        return row
+
+    writer.writerows(map(add_first_location, infos))
+
+
+def _write_yaml(infos):
+    """
+    Dump yaml data with support for OrderedDicts.
+
+    Allows for better human-readability of output: such as dataset ID field first, sources last.
+
+    (Ordered dicts are output identically to normal yaml dicts: their order is purely for readability)
+    """
+
+    # We can't control how many ancestors this dumper API uses.
+    # pylint: disable=too-many-ancestors
+    class OrderedDumper(yaml.SafeDumper):
+        pass
+
+    def _dict_representer(dumper, data):
+        return dumper.represent_mapping(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, data.items())
+
+    def _range_representer(dumper, data):
+        # type: (yaml.Dumper, Range) -> Node
+        begin, end = data
+
+        # pyyaml doesn't output timestamps in flow style as timestamps(?)
+        if isinstance(begin, datetime.datetime):
+            begin = begin.isoformat()
+        if isinstance(end, datetime.datetime):
+            end = end.isoformat()
+
+        return dumper.represent_mapping(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            (('begin', begin), ('end', end)),
+            flow_style=True
+        )
+
+    def _reduced_accuracy_decimal_representer(dumper, data):
+        # type: (yaml.Dumper, Decimal) -> Node
+        return dumper.represent_float(
+            float(data)
+        )
+
+    OrderedDumper.add_representer(OrderedDict, _dict_representer)
+    OrderedDumper.add_representer(Range, _range_representer)
+    OrderedDumper.add_representer(Decimal, _reduced_accuracy_decimal_representer)
+    return yaml.dump_all(infos, sys.stdout, OrderedDumper, default_flow_style=False, indent=4)
+
+
+_OUTPUT_WRITERS = {
+    'csv': _write_csv,
+    'yaml': _write_yaml,
+}
+
+
+@dataset_cmd.command('info', help="Display dataset information")
+@click.option('--show-sources', help='Also show source datasets', is_flag=True, default=False)
+@click.option('--show-derived', help='Also show derived datasets', is_flag=True, default=False)
+@click.option('-f', help='Output format',
+              type=click.Choice(_OUTPUT_WRITERS.keys()), default='yaml', show_default=True)
+@click.option('--max-depth',
+              help='Maximum sources/derived depth to travel',
+              type=int,
+              # Unlikely to be hit, but will avoid total-death by circular-references.
+              default=99)
 @click.argument('ids', nargs=-1)
 @ui.pass_index()
-def info_cmd(index, show_sources, show_derived, ids):
-    for id_ in ids:
-        dataset = index.datasets.get(id_, include_sources=show_sources)
-        if not dataset:
-            click.echo('%s missing' % id_)
-            continue
+def info_cmd(index, show_sources, show_derived, f, max_depth, ids):
+    # type: (Index, bool, bool, Iterable[str]) -> None
 
-        yaml.safe_dump(build_dataset_info(index, dataset, show_derived), stream=sys.stdout)
+    # Using an array wrapper to get around the lack of "nonlocal" in py2
+    missing_datasets = [0]
 
+    def get_datasets(ids):
+        for id_ in ids:
+            dataset = index.datasets.get(id_, include_sources=show_sources)
+            if dataset:
+                yield dataset
+            else:
+                click.echo('%s missing' % id_, err=True)
+                missing_datasets[0] += 1
 
-def _write_csv(info):
-    writer = csv.DictWriter(sys.stdout, ['id', 'product', 'location'], extrasaction='ignore')
-    writer.writeheader()
-    writer.writerows(info)
+    _OUTPUT_WRITERS[f](
+        build_dataset_info(index,
+                           dataset,
+                           show_sources=show_sources,
+                           show_derived=show_derived,
+                           max_depth=max_depth)
+        for dataset in get_datasets(ids)
+    )
+
+    sys.exit(missing_datasets[0])
 
 
 @dataset_cmd.command('search')
-@click.option('-f', help='Output format', type=click.Choice(['yaml', 'csv']), default='csv', show_default=True)
+@click.option('-f', help='Output format',
+              type=click.Choice(_OUTPUT_WRITERS.keys()), default='yaml', show_default=True)
 @ui.parsed_search_expressions
 @ui.pass_index()
 def search_cmd(index, f, expressions):
@@ -269,11 +397,10 @@ def search_cmd(index, f, expressions):
     Search available Datasets
     """
     datasets = index.datasets.search(**expressions)
-    info = (build_dataset_info(index, dataset) for dataset in datasets)
-    {
-        'csv': _write_csv,
-        'yaml': yaml.dump_all
-    }[f](info)
+    _OUTPUT_WRITERS[f](
+        build_dataset_info(index, dataset)
+        for dataset in datasets
+    )
 
 
 def _get_derived_set(index, id_):
@@ -312,7 +439,7 @@ def archive_cmd(index, archive_derived, dry_run, ids):
 @click.option('--derived-tolerance-seconds',
               help="Only restore derived datasets that were archived "
                    "this recently to the original dataset",
-              default=10*60)
+              default=10 * 60)
 @click.argument('ids', nargs=-1)
 @ui.pass_index()
 def restore_cmd(index, restore_derived, derived_tolerance_seconds, dry_run, ids):
@@ -335,17 +462,17 @@ def _restore_one(dry_run, id_, index, restore_derived, tolerance):
     _LOG.debug("%s selected", len(to_process))
 
     # Only the already-archived ones.
-    to_process = {d for d in to_process if d.archived_time is not None}
+    to_process = {d for d in to_process if d.is_archived}
     _LOG.debug("%s selected are archived", len(to_process))
 
     def within_tolerance(dataset):
-        if not dataset.archived_time:
+        if not dataset.is_archived:
             return False
         t = target_dataset.archived_time
         return (t - tolerance) <= dataset.archived_time <= (t + tolerance)
 
     # Only those archived around the same time as the target.
-    if restore_derived and target_dataset.archived_time:
+    if restore_derived and target_dataset.is_archived:
         to_process = set(filter(within_tolerance, to_process))
         _LOG.debug("%s selected were archived within the tolerance", len(to_process))
 

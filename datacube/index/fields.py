@@ -3,7 +3,11 @@
 Common datatypes for DB drivers.
 """
 from __future__ import absolute_import
-# For the search API.
+
+from datetime import date, datetime, time
+
+from dateutil.tz import tz
+
 from datacube.model import Range
 from .exceptions import UnknownFieldError
 
@@ -16,6 +20,10 @@ class Field(object):
     def __init__(self, name, description):
         self.name = name
         self.description = description
+
+        # Does selecting this affect the output rows?
+        # (eg. Does this join other tables that aren't 1:1 with datasets.)
+        self.affects_row_selection = False
 
     def __eq__(self, value):
         """
@@ -52,17 +60,33 @@ class OrExpression(Expression):
         return any(expr.evaluate(ctx) for expr in self.exprs)
 
 
+def as_expression(field, value):
+    """
+    Convert a single field/value to expression, following the "simple" convensions.
+    """
+    if isinstance(value, Range):
+        return field.between(value.begin, value.end)
+    elif isinstance(value, list):
+        return OrExpression(*(as_expression(field, val) for val in value))
+    # Treat a date (day) as a time range.
+    elif isinstance(value, date) and not isinstance(value, datetime):
+        return as_expression(
+            field,
+            Range(
+                datetime.combine(value, time.min.replace(tzinfo=tz.tzutc())),
+                datetime.combine(value, time.max.replace(tzinfo=tz.tzutc()))
+            )
+        )
+    else:
+        return field == value
+
+
 def _to_expression(get_field, name, value):
     field = get_field(name)
     if field is None:
         raise UnknownFieldError('Unknown field %r' % name)
 
-    if isinstance(value, Range):
-        return field.between(value.begin, value.end)
-    if isinstance(value, list):
-        return OrExpression(*[_to_expression(get_field, name, val) for val in value])
-    else:
-        return field == value
+    return as_expression(field, value)
 
 
 def to_expressions(get_field, **query):

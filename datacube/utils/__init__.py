@@ -9,20 +9,21 @@ import importlib
 import itertools
 import json
 import logging
-import re
 import pathlib
+import re
+from collections import OrderedDict
 from datetime import datetime, date
-
-from dateutil.tz import tzutc
+from itertools import chain
 from math import ceil
+from uuid import UUID
 
 import dateutil.parser
 import jsonschema
+import netCDF4
 import numpy
-from osgeo import ogr
 import xarray
-
 import yaml
+from dateutil.tz import tzutc
 
 try:
     from yaml import CSafeLoader as SafeLoader
@@ -121,6 +122,23 @@ def get_doc_offset(offset, document):
     return value
 
 
+def get_doc_offset_safe(offset, document):
+    """
+    :type offset: list[str]
+    :type document: dict
+
+    >>> get_doc_offset_safe(['a'], {'a': 4})
+    4
+    >>> get_doc_offset_safe(['a', 'b'], {'a': {'b': 4}})
+    4
+    >>> get_doc_offset_safe(['a'], {})
+    """
+    try:
+        return get_doc_offset(offset, document)
+    except KeyError:
+        return None
+
+
 def _parse_time_generic(time):
     if isinstance(time, compat.string_types):
         return dateutil.parser.parse(time)
@@ -166,7 +184,7 @@ def data_resolution_and_offset(data):
 # Functions for working with YAML documents and configurations
 ###
 
-_DOCUMENT_EXTENSIONS = ('.yaml', '.yml', '.json')
+_DOCUMENT_EXTENSIONS = ('.yaml', '.yml', '.json', '.nc')
 _COMPRESSION_EXTENSIONS = ('', '.gz')
 _ALL_SUPPORTED_EXTENSIONS = tuple(doc_type + compression_type
                                   for doc_type in _DOCUMENT_EXTENSIONS
@@ -252,9 +270,27 @@ def read_documents(*paths):
                 yield path, json.load(opener(str(path), 'r'))
             except ValueError as e:
                 raise InvalidDocException('Failed to load %s: %s' % (path, e))
+        elif suffix == '.nc':
+            try:
+                for doc in read_strings_from_netcdf(path, variable='dataset'):
+                    yield path, yaml.load(doc, Loader=NoDatesSafeLoader)
+            except Exception as e:
+                raise InvalidDocException('Unable to load dataset information from NetCDF file: %s. %s' % (path, e))
         else:
             raise ValueError('Unknown document type for {}; expected one of {!r}.'
                              .format(path.name, _ALL_SUPPORTED_EXTENSIONS))
+
+
+def read_strings_from_netcdf(path, variable):
+    """Load all of the string encoded data from a variable in a NetCDF file.
+
+    By 'string', the CF conventions mean ascii.
+
+    Useful for loading dataset metadata information.
+    """
+    with netCDF4.Dataset(str(path)) as ds:
+        for chars in ds[variable]:
+            yield str(numpy.char.decode(netCDF4.chartostring(chars)))
 
 
 def validate_document(document, schema, schema_folder=None):
@@ -353,18 +389,25 @@ def transform_object_tree(f, o, key_transform=lambda k: k):
     :param o: document/object
     :param key_transform: Optional function to apply on any dictionary keys.
 
-    >>> transform_object_tree(lambda a: a+1, [1, 2, 3])
+    >>> add_one = lambda a: a + 1
+    >>> transform_object_tree(add_one, [1, 2, 3])
     [2, 3, 4]
-    >>> transform_object_tree(lambda a: a+1, {'a': 1, 'b': 2, 'c': 3}) == {'a': 2, 'b': 3, 'c': 4}
+    >>> transform_object_tree(add_one, {'a': 1, 'b': 2, 'c': 3}) == {'a': 2, 'b': 3, 'c': 4}
     True
-    >>> transform_object_tree(lambda a: a+1, {'a': 1, 'b': (2, 3), 'c': [4, 5]}) == {'a': 2, 'b': (3, 4), 'c': [5, 6]}
+    >>> transform_object_tree(add_one, {'a': 1, 'b': (2, 3), 'c': [4, 5]}) == {'a': 2, 'b': (3, 4), 'c': [5, 6]}
     True
-    >>> transform_object_tree(lambda a: a+1, {1: 1, '2': 2, 3.0: 3}, key_transform=float) == {1.0: 2, 2.0: 3, 3.0: 4}
+    >>> transform_object_tree(add_one, {1: 1, '2': 2, 3.0: 3}, key_transform=float) == {1.0: 2, 2.0: 3, 3.0: 4}
     True
+    >>> # Order must be maintained
+    >>> transform_object_tree(add_one, OrderedDict([('z', 1), ('w', 2), ('y', 3), ('s', 7)]))
+    OrderedDict([('z', 2), ('w', 3), ('y', 4), ('s', 8)])
     """
+
     def recur(o_):
         return transform_object_tree(f, o_, key_transform=key_transform)
 
+    if isinstance(o, OrderedDict):
+        return OrderedDict((key_transform(k), recur(v)) for k, v in o.items())
     if isinstance(o, dict):
         return {key_transform(k): recur(v) for k, v in o.items()}
     if isinstance(o, list):
@@ -385,6 +428,8 @@ def jsonify_document(doc):
     >>> # Converts keys to strings:
     >>> sorted(jsonify_document({1: 'a', '2': 'b'}).items())
     [('1', 'a'), ('2', 'b')]
+    >>> jsonify_document({'k': UUID("1f231570-e777-11e6-820f-185e0f80a5c0")})
+    {'k': '1f231570-e777-11e6-820f-185e0f80a5c0'}
     """
 
     def fixup_value(v):
@@ -395,10 +440,13 @@ def jsonify_document(doc):
                 return "Infinity"
             if v == float("-inf"):
                 return "-Infinity"
+            return v
         if isinstance(v, (datetime, date)):
             return v.isoformat()
         if isinstance(v, numpy.dtype):
             return v.name
+        if isinstance(v, UUID):
+            return str(v)
         return v
 
     return transform_object_tree(fixup_value, doc, key_transform=str)
@@ -512,9 +560,9 @@ def _set_doc_offset(offset, document, value):
 
 
 class DocReader(object):
-    def __init__(self, field_offsets, search_fields, doc):
+    def __init__(self, type_definition, search_fields, doc):
         """
-        :type field_offsets: dict[str,list[str]]
+        :type system_offsets: dict[str,list[str]]
         :type doc: dict
         >>> d = DocReader({'lat': ['extent', 'lat']}, {}, doc={'extent': {'lat': 4}})
         >>> d.lat
@@ -532,41 +580,65 @@ class DocReader(object):
         AttributeError: Unknown field 'lon'. Expected one of ['lat']
         """
         self.__dict__['_doc'] = doc
-        self.__dict__['_fields'] = {name: field for name, field in search_fields.items() if hasattr(field, 'extract')}
-        self._fields.update(field_offsets)
+
+        # The user-configurable search fields for this dataset type.
+        self.__dict__['_search_fields'] = {name: field
+                                           for name, field in search_fields.items()
+                                           if hasattr(field, 'extract')}
+
+        # The field offsets that the datacube itself understands: id, format, sources etc.
+        # (See the metadata-type-schema.yaml or the comments in default-metadata-types.yaml)
+        self.__dict__['_system_offsets'] = {name: field
+                                            for name, field in type_definition.items()
+                                            if name != 'search_fields'}
 
     def __getattr__(self, name):
-        field = self._fields.get(name)
-        if field is None:
+        offset = self._system_offsets.get(name)
+        field = self._search_fields.get(name)
+        if offset:
+            return get_doc_offset(offset, self._doc)
+        elif field:
+            return field.extract(self._doc)
+        else:
             raise AttributeError(
                 'Unknown field %r. Expected one of %r' % (
-                    name, list(self._fields.keys())
+                    name, list(chain(self._system_offsets.keys(), self._search_fields.keys()))
                 )
             )
-        return self._unsafe_get_field(field)
 
     def __setattr__(self, name, val):
-        offset = self._fields.get(name)
+        offset = self._system_offsets.get(name)
         if offset is None:
             raise AttributeError(
-                'Unknown field %r. Expected one of %r' % (
+                'Unknown field offset %r. Expected one of %r' % (
                     name, list(self._fields.keys())
                 )
             )
         return _set_doc_offset(offset, self._doc, val)
 
-    def _unsafe_get_field(self, field):
-        if isinstance(field, list):
-            return get_doc_offset(field, self._doc)
-        else:
-            return field.extract(self._doc)
-
     @property
     def fields(self):
         fields = {}
-        for name, field in self._fields.items():
+        fields.update(self.search_fields)
+        fields.update(self.system_fields)
+        return fields
+
+    @property
+    def search_fields(self):
+        fields = {}
+        for name, field in self._search_fields.items():
             try:
-                fields[name] = self._unsafe_get_field(field)
+                fields[name] = field.extract(self._doc)
+            except (AttributeError, KeyError, ValueError):
+                continue
+        return fields
+
+    @property
+    def system_fields(self):
+        fields = {}
+        for name, offset in self._system_offsets.items():
+            try:
+                fields[name] = get_doc_offset(offset, self._doc)
             except (AttributeError, KeyError, ValueError):
                 continue
         return fields

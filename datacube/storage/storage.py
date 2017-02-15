@@ -4,14 +4,16 @@ Create/store dataset data into storage units based on the provided storage mappi
 """
 from __future__ import absolute_import, division, print_function
 
+import math
 import logging
 from contextlib import contextmanager
 from pathlib import Path
 
-from datacube.model import CRS
 from datacube.storage import netcdf_writer
 from datacube.config import OPTIONS
-from datacube.utils import clamp, datetime_to_seconds_since_1970, is_url, uri_to_local_path
+from datacube.utils import clamp, data_resolution_and_offset, datetime_to_seconds_since_1970, DatacubeException
+from datacube.utils import is_url, uri_to_local_path
+from datacube.utils import geometry
 from datacube.compat import urlparse, urljoin
 
 try:
@@ -67,29 +69,56 @@ else:
         return src.affine
 
 
-def _calc_offsets(off, src_size, dst_size):
-    """
-    >>> _calc_offsets(11, 10, 12) # no overlap
-    (10, 0, 0)
-    >>> _calc_offsets(-11, 12, 10) # no overlap
-    (0, 10, 0)
-    >>> _calc_offsets(5, 10, 12) # overlap
-    (5, 0, 5)
-    >>> _calc_offsets(-5, 12, 10) # overlap
-    (0, 5, 5)
-    >>> _calc_offsets(5, 10, 4) # containment
-    (5, 0, 4)
-    >>> _calc_offsets(-5, 4, 10) # containment
-    (0, 5, 4)
-    """
-    read_off = clamp(off, 0, src_size)
-    write_off = clamp(-off, 0, dst_size)
-    size = min(src_size - read_off, dst_size - write_off)
-    return read_off, write_off, size
+def _calc_offsets_impl(off, scale, src_size, dst_size):
+    assert scale >= 1-1e-5
+
+    if off >= 0:
+        write_off = 0
+    else:
+        write_off = math.ceil((-off-0.5)/scale)
+    read_off = round((write_off+0.5)*scale-0.5+off) - round(0.5*(scale-1.0))  # assuming read_size/write_size ~= scale
+    if read_off >= src_size:
+        return 0, 0, 0, 0
+
+    write_end = dst_size
+    write_size = write_end-write_off
+    read_end = read_off+round(write_size*scale)
+    if read_end > src_size:
+        # +0.5 below is a fudge that will return last row in more situations, but will change the scale more
+        write_end = math.floor((src_size-off+0.5)/scale)
+        write_size = write_end-write_off
+        read_end = clamp(read_off+round(write_size*scale), read_off, src_size)
+    read_size = read_end-read_off
+
+    return int(read_off), int(write_off), int(read_size), int(write_size)
 
 
-def _no_scale(affine, eps=0.01):
-    return abs(affine.a - 1.0) < eps and abs(affine.e - 1.0) < eps
+def _calc_offsets2(off, scale, src_size, dst_size):
+    if scale < 0:
+        r_off, write_off, read_size, write_size = _calc_offsets_impl(off + dst_size*scale, -scale, src_size, dst_size)
+        return r_off, dst_size - write_size - write_off, read_size, write_size
+    else:
+        return _calc_offsets_impl(off, scale, src_size, dst_size)
+
+
+def _read_decimated(array_transform, src, dest_shape):
+    dy_dx = (array_transform.f, array_transform.c)
+    sy_sx = (array_transform.e, array_transform.a)
+    read, write, read_shape, write_shape = zip(*map(_calc_offsets2, dy_dx, sy_sx, src.shape, dest_shape))
+    if all(write_shape):
+        window = ((read[0], read[0] + read_shape[0]), (read[1], read[1] + read_shape[1]))
+        tmp = src.read(window=window, out_shape=write_shape)
+        scale = (read_shape[0]/write_shape[0] if sy_sx[0] > 0 else -read_shape[0]/write_shape[0],
+                 read_shape[1]/write_shape[1] if sy_sx[1] > 0 else -read_shape[1]/write_shape[1])
+        offset = (read[0] + (0 if sy_sx[0] > 0 else read_shape[0]),
+                  read[1] + (0 if sy_sx[1] > 0 else read_shape[1]))
+        transform = Affine(scale[1], 0, offset[1], 0, scale[0], offset[0])
+        return tmp[::(-1 if sy_sx[0] < 0 else 1), ::(-1 if sy_sx[1] < 0 else 1)], write, transform
+    return None, None, None
+
+
+def _no_scale(affine, eps=1e-5):
+    return abs(abs(affine.a) - 1.0) < eps and abs(abs(affine.e) - 1.0) < eps
 
 
 def _no_fractional_translate(affine, eps=0.01):
@@ -105,22 +134,19 @@ def read_from_source(source, dest, dst_transform, dst_nodata, dst_projection, re
     """
     with source.open() as src:
         array_transform = ~src.transform * dst_transform
-        if (src.crs == dst_projection and _no_scale(array_transform) and
-                (resampling == Resampling.nearest or _no_fractional_translate(array_transform))):
-            dy_dx = int(round(array_transform.f)), int(round(array_transform.c))
-            read, write, shape = zip(*map(_calc_offsets, dy_dx, src.shape, dest.shape))
-
+        # if the CRS is the same use decimated reads if possible (NN or 1:1 scaling)
+        if src.crs == dst_projection and _no_scale(array_transform) and (resampling == Resampling.nearest or
+                                                                         _no_fractional_translate(array_transform)):
             dest.fill(dst_nodata)
-            if all(shape):
-                window = ((read[0], read[0] + shape[0]), (read[1], read[1] + shape[1]))
-                tmp = src.read(window=window)
-                numpy.copyto(dest[write[0]:write[0] + shape[0], write[1]:write[1] + shape[1]],
-                             tmp, where=(tmp != src.nodata))
+            tmp, offset, _ = _read_decimated(array_transform, src, dest.shape)
+            if tmp is None:
+                return
+            dest = dest[offset[0]:offset[0] + tmp.shape[0], offset[1]:offset[1] + tmp.shape[1]]
+            numpy.copyto(dest, tmp, where=(tmp != src.nodata))
         else:
             if dest.dtype == numpy.dtype('int8'):
                 dest = dest.view(dtype='uint8')
                 dst_nodata = dst_nodata.astype('uint8')
-
             src.reproject(dest,
                           dst_transform=dst_transform,
                           dst_crs=str(dst_projection),
@@ -193,7 +219,7 @@ class BandDataSource(object):
 
     @property
     def crs(self):
-        return CRS(_rasterio_crs_wkt(self.source.ds))
+        return geometry.CRS(_rasterio_crs_wkt(self.source.ds))
 
     @property
     def transform(self):
@@ -207,12 +233,76 @@ class BandDataSource(object):
     def shape(self):
         return self.source.shape
 
-    def read(self, window=None):
-        return self.source.ds.read(indexes=self.source.bidx, window=window)
+    def read(self, window=None, out_shape=None):
+        return self.source.ds.read(indexes=self.source.bidx, window=window, out_shape=out_shape)
 
     def reproject(self, dest, dst_transform, dst_crs, dst_nodata, resampling, **kwargs):
         return rasterio.warp.reproject(self.source,
                                        dest,
+                                       src_nodata=self.nodata,
+                                       dst_transform=dst_transform,
+                                       dst_crs=str(dst_crs),
+                                       dst_nodata=dst_nodata,
+                                       resampling=resampling,
+                                       **kwargs)
+
+
+class NetCDFDataSource(object):
+    def __init__(self, dataset, variable, slab=None, nodata=None):
+        self.dataset = dataset
+        self.variable = self.dataset[variable]
+        self.slab = slab or {}
+        if nodata is None:
+            nodata = self.variable.getncattr('_FillValue')
+        self.nodata = nodata
+
+    @property
+    def crs(self):
+        crs_var_name = self.variable.grid_mapping
+        crs_var = self.dataset[crs_var_name]
+        return geometry.CRS(crs_var.crs_wkt)
+
+    @property
+    def transform(self):
+        dims = self.crs.dimensions
+        xres, xoff = data_resolution_and_offset(self.dataset[dims[1]])
+        yres, yoff = data_resolution_and_offset(self.dataset[dims[0]])
+        return Affine.translation(xoff, yoff) * Affine.scale(xres, yres)
+
+    @property
+    def dtype(self):
+        return self.variable.dtype
+
+    @property
+    def shape(self):
+        return self.variable.shape
+
+    def read(self, window=None, out_shape=None):
+        data = self.variable
+        if window is None:
+            window = ((0, data.shape[0]), (0, data.shape[1]))
+        data_shape = (window[0][1]-window[0][0]), (window[1][1]-window[1][0])
+        if out_shape is None:
+            out_shape = data_shape
+        xidx = window[0][0] + ((numpy.arange(out_shape[1])+0.5)*(data_shape[1]/out_shape[1])-0.5).round().astype('int')
+        yidx = window[1][0] + ((numpy.arange(out_shape[0])+0.5)*(data_shape[0]/out_shape[0])-0.5).round().astype('int')
+        slab = {self.crs.dimensions[1]: xidx, self.crs.dimensions[0]: yidx}
+        slab.update(self.slab)
+        return data[tuple(slab[d] for d in self.variable.dimensions)]
+
+    def reproject(self, dest, dst_transform, dst_crs, dst_nodata, resampling, **kwargs):
+        dst_poly = geometry.polygon_from_transform(dest.shape[1], dest.shape[0],
+                                                   dst_transform, dst_crs).to_crs(self.crs)
+        src_poly = geometry.polygon_from_transform(self.shape[1], self.shape[0],
+                                                   self.transform, self.crs)
+        bounds = dst_poly.intersection(src_poly)
+        geobox = geometry.GeoBox.from_geopolygon(bounds, (self.transform.e, self.transform.a), crs=self.crs)
+        tmp, _, tmp_transform = _read_decimated(~self.transform * geobox.affine, self, geobox.shape)
+
+        return rasterio.warp.reproject(tmp,
+                                       dest,
+                                       src_transform=self.transform * tmp_transform,
+                                       src_crs=str(geobox.crs),
                                        src_nodata=self.nodata,
                                        dst_transform=dst_transform,
                                        dst_crs=str(dst_crs),
@@ -236,8 +326,8 @@ class OverrideBandDataSource(object):
     def shape(self):
         return self.source.shape
 
-    def read(self, window=None):
-        return self.source.ds.read(indexes=self.source.bidx, window=window)
+    def read(self, window=None, out_shape=None):
+        return self.source.ds.read(indexes=self.source.bidx, window=window, out_shape=out_shape)
 
     def reproject(self, dest, dst_transform, dst_crs, dst_nodata, resampling, **kwargs):
         source = self.read(self.source)  # TODO: read only the part the we care about
@@ -284,7 +374,7 @@ class BaseRasterDataSource(object):
                     transform = self.get_transform(src.shape)
 
                 try:
-                    crs = CRS(_rasterio_crs_wkt(src))
+                    crs = geometry.CRS(_rasterio_crs_wkt(src))
                 except ValueError:
                     override = True
                     crs = self.get_crs()
@@ -405,11 +495,7 @@ class DatasetSource(BaseRasterDataSource):
         return idx
 
     def get_transform(self, shape):
-        bounds = self._dataset.bounds
-        width = bounds.right - bounds.left
-        height = bounds.top - bounds.bottom
-        return (Affine.translation(bounds.left, bounds.bottom) *
-                Affine.scale(width / shape[1], height / shape[0]))
+        return self._dataset.transform * Affine.scale(1/shape[1], 1/shape[0])
 
     def get_crs(self):
         return self._dataset.crs
@@ -422,7 +508,7 @@ def create_netcdf_storage_unit(filename,
     Create a NetCDF file on disk.
 
     :param pathlib.Path filename: filename to write to
-    :param datacube.model.CRS crs: Datacube CRS object defining the spatial projection
+    :param datacube.utils.geometry.CRS crs: Datacube CRS object defining the spatial projection
     :param dict coordinates: Dict of named `datacube.model.Coordinate`s to create
     :param dict variables: Dict of named `datacube.model.Variable`s to create
     :param dict variable_params:
@@ -482,6 +568,12 @@ def write_dataset_to_netcdf(dataset, filename, global_attributes=None, variable_
     global_attributes = global_attributes or {}
     variable_params = variable_params or {}
     filename = Path(filename)
+
+    if not dataset.data_vars.keys():
+        raise DatacubeException('Cannot save empty dataset to disk.')
+
+    if not hasattr(dataset, 'crs'):
+        raise DatacubeException('Dataset does not contain CRS, cannot write to NetCDF file.')
 
     nco = create_netcdf_storage_unit(filename,
                                      dataset.crs,

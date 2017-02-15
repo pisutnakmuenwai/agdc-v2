@@ -7,38 +7,35 @@
 # pylint: disable=singleton-comparison
 
 """
-Lower-level database access.
+Persistence API implementation for postgres.
 """
-from __future__ import absolute_import
-
-import json
 import logging
-import re
 
-import datacube
-from datacube.compat import string_types
-from datacube.config import LocalConfig
-from datacube.index.exceptions import DuplicateRecordError
-from datacube.index.fields import OrExpression
-from datacube.model import Range
-from datacube.utils import jsonify_document
 from sqlalchemy import cast
-from sqlalchemy import create_engine, select, text, bindparam, and_, or_, func, literal, distinct
 from sqlalchemy import delete
+from sqlalchemy import select, text, bindparam, and_, or_, func, literal, distinct
 from sqlalchemy.dialects.postgresql import INTERVAL
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.engine.url import URL as EngineUrl
 from sqlalchemy.exc import IntegrityError
 
-from . import tables
+from datacube.index.exceptions import DuplicateRecordError, MissingRecordError
+from datacube.index.fields import OrExpression
+from datacube.index.postgres._fields import PgExpression
+from datacube.model import Range
 from . import _dynamic as dynamic
-from ._fields import parse_fields, NativeField
+from . import tables
+from ._fields import parse_fields, NativeField, Expression, PgField
 from .tables import DATASET, DATASET_SOURCE, METADATA_TYPE, DATASET_LOCATION, DATASET_TYPE
 
-_LIB_ID = 'agdc-' + str(datacube.__version__)
+try:
+    from typing import Iterable
+    from typing import Tuple
+except ImportError:
+    pass
 
 DATASET_URI_FIELD = DATASET_LOCATION.c.uri_scheme + ':' + DATASET_LOCATION.c.uri_body
-_DATASET_SELECT_FIELDS = (
+# Fields for selecting dataset with the latest local uri
+_DATASET_SELECT_W_LOCAL = (
     DATASET,
     # The most recent file uri. We may want more advanced path selection in the future...
     select([
@@ -50,10 +47,16 @@ _DATASET_SELECT_FIELDS = (
         )
     ).order_by(
         DATASET_LOCATION.c.added.desc()
-    ).limit(1).label('local_uri')
+    ).limit(1).label('uri')
+)
+# Fields for selecting dataset with a single joined uri (specify join yourself in your query)
+_DATASET_SELECT_W_URI = (
+    DATASET,
+    DATASET_URI_FIELD.label('uri')
 )
 
 PGCODE_UNIQUE_CONSTRAINT = '23505'
+PGCODE_FOREIGN_KEY_VIOLATION = '23503'
 
 _LOG = logging.getLogger(__name__)
 
@@ -77,262 +80,61 @@ def _split_uri(uri):
     return scheme, body
 
 
-class IndexSetupError(Exception):
-    pass
+def get_native_fields():
+    # Native fields (hard-coded into the schema)
+    fields = {
+        'id': NativeField(
+            'id',
+            None,
+            DATASET.c.id
+        ),
+        'product': NativeField(
+            'product',
+            'Dataset type name',
+            DATASET_TYPE.c.name
+        ),
+        'dataset_type_id': NativeField(
+            'dataset_type_id',
+            'ID of a dataset type',
+            DATASET.c.dataset_type_ref
+        ),
+        'metadata_type': NativeField(
+            'metadata_type',
+            'Metadata type of dataset',
+            METADATA_TYPE.c.name
+        ),
+        'metadata_type_id': NativeField(
+            'metadata_type_id',
+            'ID of a metadata type',
+            DATASET.c.metadata_type_ref
+        ),
+
+        # Fields that can affect row selection
+
+        # Note that this field is a single uri: selecting it will result in one-result per uri.
+        # (ie. duplicate datasets if multiple uris, no dataset if no uris)
+        'uri': NativeField(
+            'uri',
+            "Dataset URI",
+            DATASET_LOCATION.c.uri_body,
+            alchemy_expression=DATASET_URI_FIELD,
+            affects_row_selection=True
+        ),
+    }
+    return fields
 
 
-class PostgresDb(object):
-    """
-    A very thin database access api.
+def get_dataset_fields(dataset_search_fields):
+    fields = get_native_fields()
 
-    It exists so that higher level modules are not tied to SQLAlchemy, connections or specifics of database-access.
-
-    (and can be unit tested without any actual databases)
-
-    Thread safe: the only shared state is the (thread-safe) sqlalchemy connection pool.
-
-    But not multiprocess safe once the first connections are made! A connection must not be shared between multiple
-    processes. You can call close() before forking if you know no other threads currently hold connections,
-    or else use a separate instance of this class in each process.
-    """
-
-    def __init__(self, engine):
-        # We don't recommend using this constructor directly as it may change.
-        # Use static methods PostgresDb.create() or PostgresDb.from_config()
-        self._engine = engine
-
-    def __getstate__(self):
-        _LOG.warning("Serializing PostgresDb engine %s", self.url)
-        return {'url': self.url}
-
-    def __setstate__(self, state):
-        self.__init__(self._create_engine(state['url']))
-
-    @property
-    def url(self):
-        return self._engine.url
-
-    @staticmethod
-    def _create_engine(url, application_name=None, pool_timeout=60):
-        return create_engine(
-            url,
-            echo=False,
-            echo_pool=False,
-
-            # 'AUTOCOMMIT' here means READ-COMMITTED isolation level with autocommit on.
-            # When a transaction is needed we will do an explicit begin/commit.
-            isolation_level='AUTOCOMMIT',
-
-            json_serializer=_to_json,
-            # If a connection is idle for this many seconds, SQLAlchemy will renew it rather
-            # than assuming it's still open. Allows servers to close idle connections without clients
-            # getting errors.
-            pool_recycle=pool_timeout,
-            connect_args={'application_name': application_name}
+    # noinspection PyTypeChecker
+    fields.update(
+        parse_fields(
+            dataset_search_fields,
+            DATASET.c.metadata
         )
-
-    @classmethod
-    def create(cls, hostname, database, username=None, password=None, port=None,
-               application_name=None, validate=True, pool_timeout=60):
-        engine = cls._create_engine(
-            EngineUrl(
-                'postgresql',
-                host=hostname, database=database, port=port,
-                username=username, password=password,
-            ),
-            application_name=application_name,
-            pool_timeout=pool_timeout)
-        if validate:
-            if not tables.database_exists(engine):
-                raise IndexSetupError('\n\nNo DB schema exists. Have you run init?\n\t{init_command}'.format(
-                    init_command='datacube system init'
-                ))
-
-            if not tables.schema_is_latest(engine):
-                raise IndexSetupError(
-                    '\n\nDB schema is out of date. '
-                    'An administrator must run init:\n\t{init_command}'.format(
-                        init_command='datacube -v system init'
-                    ))
-        return PostgresDb(engine)
-
-    @classmethod
-    def from_config(cls, config=LocalConfig.find(), application_name=None, validate_connection=True):
-        app_name = cls._expand_app_name(application_name)
-
-        return PostgresDb.create(
-            config.db_hostname,
-            config.db_database,
-            config.db_username,
-            config.db_password,
-            config.db_port,
-            application_name=app_name,
-            validate=validate_connection,
-            pool_timeout=config.db_connection_timeout
-        )
-
-    def close(self):
-        """
-        Close any idle connections in the pool.
-
-        This is good practice if you are keeping this object in scope
-        but wont be using it for a while.
-
-        Connections should not be shared between processes, so this should be called
-        before forking if the same instance will be used.
-
-        (connections are normally closed automatically when this object is
-         garbage collected)
-        """
-        self._engine.dispose()
-
-    @classmethod
-    def _expand_app_name(cls, application_name):
-        """
-        >>> PostgresDb._expand_app_name(None) #doctest: +ELLIPSIS
-        'agdc-...'
-        >>> PostgresDb._expand_app_name('') #doctest: +ELLIPSIS
-        'agdc-...'
-        >>> PostgresDb._expand_app_name('cli') #doctest: +ELLIPSIS
-        'cli agdc-...'
-        >>> PostgresDb._expand_app_name('a b.c/d')
-        'a-b-c-d agdc-...'
-        >>> PostgresDb._expand_app_name(5)
-        Traceback (most recent call last):
-        ...
-        TypeError: Application name must be a string
-        """
-        full_name = _LIB_ID
-        if application_name:
-            if not isinstance(application_name, string_types):
-                raise TypeError('Application name must be a string')
-
-            full_name = re.sub('[^0-9a-zA-Z]+', '-', application_name) + ' ' + full_name
-
-        if len(full_name) > 64:
-            _LOG.warning('Application name is too long: Truncating to %s chars', (64 - len(_LIB_ID) - 1))
-        return full_name[-64:]
-
-    def init(self, with_permissions=True):
-        """
-        Init a new database (if not already set up).
-
-        :return: If it was newly created.
-        """
-        is_new = tables.ensure_db(self._engine, with_permissions=with_permissions)
-        if not is_new:
-            tables.update_schema(self._engine)
-
-        return is_new
-
-    def connect(self):
-        """
-        Borrow a connection from the pool.
-        """
-        return _PostgresDbConnection(self._engine)
-
-    def begin(self):
-        """
-        Start a transaction.
-
-        Returns an instance that will maintain a single connection in a transaction.
-
-        Call commit() or rollback() to complete the transaction or use a context manager:
-
-            with db.begin() as trans:
-                trans.insert_dataset(...)
-
-        :rtype: _PostgresDbInTransaction
-        """
-        return _PostgresDbInTransaction(self._engine)
-
-    @staticmethod
-    def get_dataset_fields(dataset_search_fields):
-        # Native fields (hard-coded into the schema)
-        fields = {
-            'id': NativeField(
-                'id',
-                None,
-                DATASET.c.id
-            ),
-            'product': NativeField(
-                'product',
-                'Dataset type name',
-                DATASET_TYPE.c.name
-            ),
-            'dataset_type_id': NativeField(
-                'dataset_type_id',
-                'ID of a dataset type',
-                DATASET.c.dataset_type_ref
-            ),
-            'metadata_type': NativeField(
-                'metadata_type',
-                'Metadata type of dataset',
-                METADATA_TYPE.c.name
-            ),
-            'metadata_type_id': NativeField(
-                'metadata_type_id',
-                'ID of a metadata type',
-                DATASET.c.metadata_type_ref
-            ),
-        }
-
-        # noinspection PyTypeChecker
-        fields.update(
-            parse_fields(
-                dataset_search_fields,
-                DATASET.c.metadata
-            )
-        )
-        return fields
-
-    def __repr__(self):
-        return "PostgresDb<engine={!r}>".format(self._engine)
-
-
-class _PostgresDbConnection(object):
-    def __init__(self, engine):
-        self._engine = engine
-        self._connection = None
-
-    def __enter__(self):
-        self._connection = self._engine.connect()
-        return PostgresDbAPI(self._connection)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._connection.close()
-        self._connection = None
-
-
-class _PostgresDbInTransaction(object):
-    """
-    Identical to PostgresDb class, but all operations
-    are run against a single connection in a transaction.
-
-    Call commit() or rollback() to complete the transaction or use a context manager:
-
-        with db.begin() as transaction:
-            transaction.insert_dataset(...)
-
-    (Don't share an instance between threads)
-    """
-
-    def __init__(self, engine):
-        self._engine = engine
-        self._connection = None
-
-    def __enter__(self):
-        self._connection = self._engine.connect()
-        self._connection.execute(text('BEGIN'))
-        return PostgresDbAPI(self._connection)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type:
-            self._connection.execute(text('ROLLBACK'))
-        else:
-            self._connection.execute(text('COMMIT'))
-        self._connection.close()
-        self._connection = None
+    )
+    return fields
 
 
 class PostgresDbAPI(object):
@@ -420,7 +222,28 @@ class PostgresDbAPI(object):
             raise
 
     def contains_dataset(self, dataset_id):
-        return bool(self._connection.execute(select([DATASET.c.id]).where(DATASET.c.id == dataset_id)).fetchone())
+        return bool(
+            self._connection.execute(
+                select(
+                    [DATASET.c.id]
+                ).where(
+                    DATASET.c.id == dataset_id
+                )
+            ).fetchone()
+        )
+
+    def get_datasets_for_location(self, uri):
+        scheme, body = _split_uri(uri)
+        return self._connection.execute(
+            select(
+                _DATASET_SELECT_W_URI
+            ).select_from(
+                DATASET_LOCATION.join(DATASET)
+            ).where(
+                and_(DATASET_LOCATION.c.uri_scheme == scheme,
+                     DATASET_LOCATION.c.uri_body == body)
+            )
+        ).fetchall()
 
     def insert_dataset_source(self, classifier, dataset_id, source_dataset_id):
         try:
@@ -433,6 +256,8 @@ class PostgresDbAPI(object):
         except IntegrityError as e:
             if e.orig.pgcode == PGCODE_UNIQUE_CONSTRAINT:
                 raise DuplicateRecordError('Source already exists')
+            if e.orig.pgcode == PGCODE_FOREIGN_KEY_VIOLATION:
+                raise MissingRecordError("Referenced source dataset doesn't exist")
             raise
 
     def archive_dataset(self, dataset_id):
@@ -457,13 +282,13 @@ class PostgresDbAPI(object):
 
     def get_dataset(self, dataset_id):
         return self._connection.execute(
-            select(_DATASET_SELECT_FIELDS).where(DATASET.c.id == dataset_id)
+            select(_DATASET_SELECT_W_LOCAL).where(DATASET.c.id == dataset_id)
         ).first()
 
     def get_derived_datasets(self, dataset_id):
         return self._connection.execute(
             select(
-                _DATASET_SELECT_FIELDS
+                _DATASET_SELECT_W_LOCAL
             ).select_from(
                 DATASET.join(DATASET_SOURCE, DATASET.c.id == DATASET_SOURCE.c.dataset_ref)
             ).where(
@@ -507,7 +332,7 @@ class PostgresDbAPI(object):
 
         # join the adjacency list with datasets table
         query = select(
-            _DATASET_SELECT_FIELDS + (aggd.c.sources, aggd.c.classes)
+            _DATASET_SELECT_W_LOCAL + (aggd.c.sources, aggd.c.classes)
         ).select_from(aggd.join(DATASET, DATASET.c.id == aggd.c.dataset_ref))
 
         return self._connection.execute(query).fetchall()
@@ -521,7 +346,7 @@ class PostgresDbAPI(object):
         """
         # Find any storage types whose 'dataset_metadata' document is a subset of the metadata.
         return self._connection.execute(
-            select(_DATASET_SELECT_FIELDS).where(DATASET.c.metadata.contains(metadata))
+            select(_DATASET_SELECT_W_LOCAL).where(DATASET.c.metadata.contains(metadata))
         ).fetchall()
 
     @staticmethod
@@ -534,14 +359,15 @@ class PostgresDbAPI(object):
         return [raw_expr(expression) for expression in expressions]
 
     @staticmethod
-    def search_datasets_query(expressions, source_exprs, select_fields=None, with_source_ids=False):
+    def search_datasets_query(expressions, source_exprs=None, select_fields=None, with_source_ids=False):
+        # type: (Tuple[Expression], Tuple[Expression], Iterable[PgField], bool) -> sqlalchemy.Expression
         if select_fields:
             select_columns = tuple(
                 f.alchemy_expression.label(f.name)
                 for f in select_fields
             )
         else:
-            select_columns = _DATASET_SELECT_FIELDS
+            select_columns = _DATASET_SELECT_W_LOCAL
 
         if with_source_ids:
             # Include the IDs of source datasets
@@ -614,9 +440,25 @@ class PostgresDbAPI(object):
         :type with_source_ids: bool
         :type select_fields: tuple[datacube.index.postgres._fields.PgField]
         :type expressions: tuple[datacube.index.postgres._fields.PgExpression]
-        :rtype: dict
         """
         select_query = self.search_datasets_query(expressions, source_exprs, select_fields, with_source_ids)
+        return self._connection.execute(select_query)
+
+    def get_duplicates(self, match_fields, expressions):
+        # type: (Tuple[PgField], Tuple[PgExpression]) -> Iterable[tuple]
+        group_expressions = tuple(f.alchemy_expression for f in match_fields)
+
+        select_query = select(
+            (func.array_agg(DATASET.c.id),) + group_expressions
+        ).select_from(
+            PostgresDbAPI._from_expression(DATASET, expressions, match_fields)
+        ).where(
+            and_(DATASET.c.archived == None, *(PostgresDbAPI._alchemify_expressions(expressions)))
+        ).group_by(
+            *group_expressions
+        ).having(
+            func.count(DATASET.c.id) > 1
+        )
         return self._connection.execute(select_query)
 
     def count_datasets(self, expressions):
@@ -798,7 +640,7 @@ class PostgresDbAPI(object):
         )
         type_id = res.inserted_primary_key[0]
 
-        search_fields = PostgresDb.get_dataset_fields(definition['dataset']['search_fields'])
+        search_fields = get_dataset_fields(definition['dataset']['search_fields'])
         self._setup_metadata_type_fields(
             type_id, name, search_fields, concurrently=concurrently
         )
@@ -814,7 +656,7 @@ class PostgresDbAPI(object):
         )
         type_id = res.first()[0]
 
-        search_fields = PostgresDb.get_dataset_fields(definition['dataset']['search_fields'])
+        search_fields = get_dataset_fields(definition['dataset']['search_fields'])
         self._setup_metadata_type_fields(
             type_id, name, search_fields, concurrently=concurrently
         )
@@ -827,23 +669,13 @@ class PostgresDbAPI(object):
         search_fields = {}
 
         for metadata_type in self.get_all_metadata_types():
-            fields = PostgresDb.get_dataset_fields(metadata_type['definition']['dataset']['search_fields'])
+            fields = get_dataset_fields(metadata_type['definition']['dataset']['search_fields'])
             search_fields[metadata_type['id']] = fields
             self._setup_metadata_type_fields(
                 metadata_type['id'],
                 metadata_type['name'],
                 fields,
                 rebuild_all, concurrently
-            )
-
-        for dataset_type in self.get_all_dataset_types():
-            self._setup_dataset_type_fields(
-                dataset_type['id'],
-                dataset_type['name'],
-                search_fields[dataset_type['metadata_type_ref']],
-                dataset_type['definition']['metadata'],
-                rebuild_all,
-                concurrently
             )
 
     def _setup_metadata_type_fields(self, id_, name, fields, rebuild_all=False, concurrently=True):
@@ -854,6 +686,16 @@ class PostgresDbAPI(object):
         dataset_filter = and_(DATASET.c.archived == None, DATASET.c.metadata_type_ref == id_)
         dynamic.check_dynamic_fields(self._connection, concurrently, dataset_filter,
                                      exclude_fields, fields, name, rebuild_all)
+
+        for dataset_type in self._get_dataset_types_for_metadata_type(id_):
+            self._setup_dataset_type_fields(
+                dataset_type['id'],
+                dataset_type['name'],
+                fields,
+                dataset_type['definition']['metadata'],
+                rebuild_all,
+                concurrently
+            )
 
     def _setup_dataset_type_fields(self, id_, name, fields, metadata_doc,
                                    rebuild_all=False, concurrently=True):
@@ -876,6 +718,15 @@ class PostgresDbAPI(object):
 
     def get_all_dataset_types(self):
         return self._connection.execute(DATASET_TYPE.select().order_by(DATASET_TYPE.c.name.asc())).fetchall()
+
+    def _get_dataset_types_for_metadata_type(self, id_):
+        return self._connection.execute(
+            DATASET_TYPE.select(
+            ).where(
+                DATASET_TYPE.c.metadata_type_ref == id_
+            ).order_by(
+                DATASET_TYPE.c.name.asc()
+            )).fetchall()
 
     def get_all_metadata_types(self):
         return self._connection.execute(METADATA_TYPE.select().order_by(METADATA_TYPE.c.name.asc())).fetchall()
@@ -928,10 +779,10 @@ class PostgresDbAPI(object):
             order by group_role.oid asc, user_role.oid asc;
         """)
         for row in result:
-            yield _from_pg_role(row['role_name']), row['user_name'], row['description']
+            yield tables.from_pg_role(row['role_name']), row['user_name'], row['description']
 
     def create_user(self, username, password, role):
-        pg_role = _to_pg_role(role)
+        pg_role = tables.to_pg_role(role)
         tables.create_user(self._connection, username, password, pg_role)
 
     def drop_user(self, username):
@@ -941,54 +792,10 @@ class PostgresDbAPI(object):
         """
         Grant a role to a user.
         """
-        pg_role = _to_pg_role(role)
+        pg_role = tables.to_pg_role(role)
 
         for user in users:
             if not tables.has_role(self._connection, user):
                 raise ValueError('Unknown user %r' % user)
 
         tables.grant_role(self._connection, pg_role, users)
-
-
-def _to_pg_role(role):
-    """
-    >>> _to_pg_role('ingest')
-    'agdc_ingest'
-    >>> _to_pg_role('fake')
-    Traceback (most recent call last):
-    ...
-    ValueError: Unknown role 'fake'. Expected one of ...
-    """
-    pg_role = 'agdc_' + role.lower()
-    if pg_role not in tables.USER_ROLES:
-        raise ValueError(
-            'Unknown role %r. Expected one of %r' %
-            (role, [r.split('_')[1] for r in tables.USER_ROLES])
-        )
-    return pg_role
-
-
-def _from_pg_role(pg_role):
-    """
-    >>> _from_pg_role('agdc_admin')
-    'admin'
-    >>> _from_pg_role('fake')
-    Traceback (most recent call last):
-    ...
-    ValueError: Not a pg role: 'fake'. Expected one of ...
-    """
-    if pg_role not in tables.USER_ROLES:
-        raise ValueError('Not a pg role: %r. Expected one of %r' % (pg_role, tables.USER_ROLES))
-
-    return pg_role.split('_')[1]
-
-
-def _to_json(o):
-    # Postgres <=9.5 doesn't support NaN and Infinity
-    fixedup = jsonify_document(o)
-    return json.dumps(fixedup, default=_json_fallback)
-
-
-def _json_fallback(obj):
-    """Fallback json serialiser."""
-    raise TypeError("Type not serializable: {}".format(type(obj)))

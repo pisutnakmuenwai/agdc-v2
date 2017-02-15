@@ -10,7 +10,6 @@ from datetime import datetime
 
 import numpy
 
-from datacube.model import CRS, BoundingBox
 from datacube.storage.masking import describe_flags_def
 from datacube.utils import geometry, data_resolution_and_offset
 
@@ -178,7 +177,7 @@ def _create_projected_grid_mapping_variable(nco, crs):
 
 
 def _write_geographical_extents_attributes(nco, extent):
-    geo_extents = extent.to_crs(CRS("EPSG:4326"))
+    geo_extents = extent.to_crs(geometry.CRS("EPSG:4326"))
     nco.geospatial_bounds = geo_extents.wkt
     nco.geospatial_bounds_crs = "EPSG:4326"
 
@@ -233,6 +232,7 @@ def netcdfy_coord(data):
 
 
 def netcdfy_data(data):
+    # NetCDF/CF Conventions only seem to allow storing ascii, not unicode
     if data.dtype.kind == 'S' and data.dtype.itemsize > 1:
         return data.view('S1').reshape(data.shape + (-1,))
     if data.dtype.kind == 'M':

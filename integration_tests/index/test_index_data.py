@@ -6,20 +6,24 @@ Integration tests: these depend on a local Postgres instance.
 """
 from __future__ import absolute_import
 
+import copy
 import datetime
-
-import pytest
 import sys
 from pathlib import Path
+from uuid import UUID
 
-from datacube.index.exceptions import DuplicateRecordError
+import pytest
+
+from datacube.index._api import Index
+from datacube.index.exceptions import DuplicateRecordError, MissingRecordError
+from datacube.index.postgres import PostgresDb
 from datacube.model import Dataset
 
-_telemetry_uuid = '4ec8fe97-e8b9-11e4-87ff-1040f381a756'
+_telemetry_uuid = UUID('4ec8fe97-e8b9-11e4-87ff-1040f381a756')
 _telemetry_dataset = {
     'product_type': 'satellite_telemetry_data',
     'checksum_path': 'package.sha1',
-    'id': _telemetry_uuid,
+    'id': str(_telemetry_uuid),
     'ga_label': 'LS8_OLITIRS_STD-MD_P00_LC81160740742015089ASA00_'
                 '116_074_20150330T022553Z20150330T022657',
 
@@ -90,10 +94,27 @@ def test_archive_datasets(index, db, local_config, default_metadata_type):
     assert len(datsets) == 1
 
 
+@pytest.fixture
+def telemetry_dataset(index, db, default_metadata_type):
+    # type: (Index, PostgresDb) -> Dataset
+    dataset_type = index.products.add_document(_pseudo_telemetry_dataset_type)
+    assert not index.datasets.has(_telemetry_uuid)
+
+    with db.begin() as transaction:
+        was_inserted = transaction.insert_dataset(
+            _telemetry_dataset,
+            _telemetry_uuid,
+            dataset_type.id
+        )
+    assert was_inserted
+
+    return index.datasets.get(_telemetry_uuid)
+
+
 def test_index_duplicate_dataset(index, db, local_config, default_metadata_type):
     """
     :type index: datacube.index._api.Index
-    :type db: datacube.index.postgres._api.PostgresDb
+    :type db: datacube.index.postgres._connections.PostgresDb
     """
     dataset_type = index.products.add_document(_pseudo_telemetry_dataset_type)
     assert not index.datasets.has(_telemetry_uuid)
@@ -108,21 +129,32 @@ def test_index_duplicate_dataset(index, db, local_config, default_metadata_type)
     assert was_inserted
     assert index.datasets.has(_telemetry_uuid)
 
+    # Insert again.
     with pytest.raises(DuplicateRecordError):
-        # Insert again. It should be ignored.ts.types.add_document(_pseudo_telemetry_dataset_type)
         with db.connect() as connection:
             was_inserted = connection.insert_dataset(
                 _telemetry_dataset,
                 _telemetry_uuid,
                 dataset_type.id
             )
+            assert not was_inserted
     assert index.datasets.has(_telemetry_uuid)
+
+
+def test_has_dataset(index, telemetry_dataset):
+    # type: (Index, Dataset) -> None
+
+    assert index.datasets.has(_telemetry_uuid)
+    assert index.datasets.has(str(_telemetry_uuid))
+
+    assert not index.datasets.has(UUID('f226a278-e422-11e6-b501-185e0f80a5c0'))
+    assert not index.datasets.has('f226a278-e422-11e6-b501-185e0f80a5c0')
 
 
 def test_transactions(index, db, local_config, default_metadata_type):
     """
     :type index: datacube.index._api.Index
-    :type db: datacube.index.postgres._api.PostgresDb
+    :type db: datacube.index.postgres._connections.PostgresDb
     """
     assert not index.datasets.has(_telemetry_uuid)
 
@@ -150,7 +182,7 @@ def test_get_missing_things(index):
 
     :type index: datacube.index._api.Index
     """
-    uuid_ = '18474b58-c8a6-11e6-a4b3-185e0f80a5c0'
+    uuid_ = UUID('18474b58-c8a6-11e6-a4b3-185e0f80a5c0')
     missing_thing = index.datasets.get(uuid_, include_sources=False)
     assert missing_thing is None, "get() should return none when it doesn't exist"
 
@@ -165,6 +197,37 @@ def test_get_missing_things(index):
     assert missing_thing is None, "get() should return none when it doesn't exist"
 
 
+def test_index_dataset_with_sources(index, default_metadata_type):
+    type_ = index.products.add_document(_pseudo_telemetry_dataset_type)
+
+    parent_doc = _telemetry_dataset.copy()
+    parent = Dataset(type_, parent_doc, None, sources={})
+    child_doc = _telemetry_dataset.copy()
+    child_doc['lineage'] = {'source_datasets': {'source': _telemetry_dataset}}
+    child_doc['id'] = '051a003f-5bba-43c7-b5f1-7f1da3ae9cfb'
+    child = Dataset(type_, child_doc, local_uri=None, sources={'source': parent})
+
+    with pytest.raises(MissingRecordError):
+        index.datasets.add(child, sources_policy='skip')
+
+    index.datasets.add(child, sources_policy='ensure')
+    assert index.datasets.get(parent.id)
+    assert index.datasets.get(child.id)
+
+    index.datasets.add(child, sources_policy='skip')
+    index.datasets.add(child, sources_policy='ensure')
+    index.datasets.add(child, sources_policy='verify')
+    # Deprecated property, but it should still work until we remove it completely.
+    index.datasets.add(child, skip_sources=True)
+
+    parent_doc['platform'] = {'code': 'LANDSAT_9'}
+    index.datasets.add(child, sources_policy='ensure')
+    index.datasets.add(child, sources_policy='skip')
+
+    with pytest.raises(ValueError):  # TODO: should be DocumentMismatchError
+        index.datasets.add(child, sources_policy='verify')
+
+
 def test_index_dataset_with_location(index, default_metadata_type):
     """
     :type index: datacube.index._api.Index
@@ -174,7 +237,7 @@ def test_index_dataset_with_location(index, default_metadata_type):
     second_file = Path('/tmp/second/something.yaml').absolute()
 
     type_ = index.products.add_document(_pseudo_telemetry_dataset_type)
-    dataset = Dataset(type_, _telemetry_dataset, first_file.as_uri())
+    dataset = Dataset(type_, _telemetry_dataset, first_file.as_uri(), sources={})
     index.datasets.add(dataset)
     stored = index.datasets.get(dataset.id)
 
@@ -190,11 +253,17 @@ def test_index_dataset_with_location(index, default_metadata_type):
     locations = index.datasets.get_locations(dataset)
     assert len(locations) == 1
     # Remove the location
-    index.datasets.remove_location(dataset, first_file.as_uri())
+    was_removed = index.datasets.remove_location(dataset, first_file.as_uri())
+    assert was_removed
+    was_removed = index.datasets.remove_location(dataset, first_file.as_uri())
+    assert not was_removed
     locations = index.datasets.get_locations(dataset)
     assert len(locations) == 0
     # Re-add the location
-    index.datasets.add_location(dataset, first_file.as_uri())
+    was_added = index.datasets.add_location(dataset, first_file.as_uri())
+    assert was_added
+    was_added = index.datasets.add_location(dataset, first_file.as_uri())
+    assert not was_added
     locations = index.datasets.get_locations(dataset)
     assert len(locations) == 1
 
@@ -219,3 +288,11 @@ def test_index_dataset_with_location(index, default_metadata_type):
     assert locations == [second_file.as_uri(), first_file.as_uri()]
     # And the second one is newer, so it should be returned as the default local path:
     assert stored.local_path == Path(second_file)
+
+    # Ability to get datasets for a location
+    # Add a second dataset with a different location (to catch lack of joins, filtering etc)
+    second_ds_doc = copy.deepcopy(_telemetry_dataset)
+    second_ds_doc['id'] = '366f32d8-e1f8-11e6-94b4-185e0f80a5c0'
+    index.datasets.add(Dataset(type_, second_ds_doc, second_file.as_uri(), sources={}))
+    dataset_ids = [d.id for d in index.datasets.get_datasets_for_location(first_file.as_uri())]
+    assert dataset_ids == [dataset.id]
