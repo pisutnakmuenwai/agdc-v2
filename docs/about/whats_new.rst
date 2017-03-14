@@ -3,6 +3,28 @@
 What's New
 ==========
 
+v1.2.3
+------
+
+ - Updated the Postgres product views to include the whole dataset metadata document.
+
+ - `init` now recreates the product views by default every time it is run: rerun init on
+   your datacube to get the improved views.
+
+ - Updated `init` to support Postgres 9.6
+
+ - URI searches are now better supported from the cli: `datacube dataset search uri = file:///some/uri/here`
+
+ - We are now part of Open Data Cube, and have a new home at https://github.com/opendatacube/datacube-core
+
+v1.2.2
+------
+
+ - Added `--allow-exclusive-lock` flag to product add/update commands, allowing faster index updates when
+   system usage can be halted.
+
+ - {version} can now be used in ingester filename patterns
+
 v1.2.0 Boring as Batman (15 February 2017)
 ------------------------------------------
  - Implemented improvements to `dataset search` and `info` cli outputs

@@ -104,7 +104,7 @@ class MetadataTypeResource(object):
 
         return allow_unsafe_updates or not bad_changes, good_changes, bad_changes
 
-    def update(self, metadata_type, allow_unsafe_updates=False):
+    def update(self, metadata_type, allow_unsafe_updates=False, allow_table_lock=False):
         """
         Update a metadata type from the document. Unsafe changes will throw a ValueError by default.
 
@@ -112,6 +112,11 @@ class MetadataTypeResource(object):
 
         :param datacube.model.MetadataType metadata_type: updated MetadataType
         :param bool allow_unsafe_updates: Allow unsafe changes. Use with caution.
+        :param allow_table_lock:
+            Allow an exclusive lock to be taken on the table while creating the indexes.
+            This will halt other user's requests until completed.
+
+            If false, creation will be slower and cannot be done in a transaction.
         :rtype: datacube.model.MetadataType
         """
         can_update, safe_changes, unsafe_changes = self.can_update(metadata_type, allow_unsafe_updates)
@@ -136,7 +141,7 @@ class MetadataTypeResource(object):
             connection.update_metadata_type(
                 name=metadata_type.name,
                 definition=metadata_type.definition,
-                concurrently=True
+                concurrently=not allow_table_lock
             )
 
         self.get_by_name_unsafe.cache_clear()
@@ -188,7 +193,8 @@ class MetadataTypeResource(object):
             raise KeyError('%s is not a valid MetadataType name' % name)
         return self._make_from_query_row(record)
 
-    def check_field_indexes(self, allow_table_lock=False, rebuild_all=False):
+    def check_field_indexes(self, allow_table_lock=False, rebuild_all=None,
+                            rebuild_views=False, rebuild_indexes=False):
         """
         Create or replace per-field indexes and views.
         :param allow_table_lock:
@@ -197,8 +203,19 @@ class MetadataTypeResource(object):
 
             If false, creation will be slightly slower and cannot be done in a transaction.
         """
+        if rebuild_all is not None:
+            warnings.warn(
+                "The rebuild_all option of check_field_indexes() is deprecated.",
+                "Instead, use rebuild_views=True or rebuild_indexes=True as needed.",
+                DeprecationWarning)
+            rebuild_views = rebuild_indexes = rebuild_all
+
         with self._db.connect() as connection:
-            connection.check_dynamic_fields(concurrently=not allow_table_lock, rebuild_all=rebuild_all)
+            connection.check_dynamic_fields(
+                concurrently=not allow_table_lock,
+                rebuild_indexes=rebuild_indexes,
+                rebuild_views=rebuild_views,
+            )
 
     def get_all(self):
         """
@@ -275,10 +292,15 @@ class ProductResource(object):
 
         return DatasetType(metadata_type, definition)
 
-    def add(self, type_):
+    def add(self, type_, allow_table_lock=False):
         """
         Add a Product.
 
+        :param allow_table_lock:
+            Allow an exclusive lock to be taken on the table while creating the indexes.
+            This will halt other user's requests until completed.
+
+            If false, creation will be slightly slower and cannot be done in a transaction.
         :param datacube.model.DatasetType type_: Product to add
         :rtype: datacube.model.DatasetType
         """
@@ -295,14 +317,15 @@ class ProductResource(object):
             metadata_type = self.metadata_type_resource.get_by_name(type_.metadata_type.name)
             if metadata_type is None:
                 _LOG.warning('Adding metadata_type "%s" as it doesn\'t exist.', type_.metadata_type.name)
-                metadata_type = self.metadata_type_resource.add(type_.metadata_type)
+                metadata_type = self.metadata_type_resource.add(type_.metadata_type, allow_table_lock=allow_table_lock)
             with self._db.connect() as connection:
                 connection.add_dataset_type(
                     name=type_.name,
                     metadata=type_.metadata_doc,
                     metadata_type_id=metadata_type.id,
                     search_fields=metadata_type.dataset_fields,
-                    definition=type_.definition
+                    definition=type_.definition,
+                    concurrently=not allow_table_lock,
                 )
         return self.get_by_name(type_.name)
 
@@ -315,7 +338,7 @@ class ProductResource(object):
 
         :param datacube.model.DatasetType product: Product to update
         :param bool allow_unsafe_updates: Allow unsafe changes. Use with caution.
-            :rtype: bool,list[change],list[change]
+        :rtype: bool,list[change],list[change]
         """
         DatasetType.validate(product.definition)
 
@@ -338,7 +361,7 @@ class ProductResource(object):
 
         return allow_unsafe_updates or not bad_changes, good_changes, bad_changes
 
-    def update(self, product, allow_unsafe_updates=False):
+    def update(self, product, allow_unsafe_updates=False, allow_table_lock=False):
         """
         Update a product. Unsafe changes will throw a ValueError by default.
 
@@ -347,6 +370,11 @@ class ProductResource(object):
 
         :param datacube.model.DatasetType product: Product to update
         :param bool allow_unsafe_updates: Allow unsafe changes. Use with caution.
+        :param allow_table_lock:
+            Allow an exclusive lock to be taken on the table while creating the indexes.
+            This will halt other user's requests until completed.
+
+            If false, creation will be slower and cannot be done in a transaction.
         :rtype: datacube.model.DatasetType
         """
 
@@ -371,7 +399,7 @@ class ProductResource(object):
         existing = self.get_by_name(product.name)
         changing_metadata_type = product.metadata_type.name != existing.metadata_type.name
         if changing_metadata_type:
-            assert False, "TODO: Ask Jeremy WTF is going on here"
+            raise ValueError("Unsafe change: cannot (currently) switch metadata types for a product")
             # TODO: Ask Jeremy WTF is going on here
             # If the two metadata types declare the same field with different postgres expressions
             # we can't safely change it.
@@ -389,29 +417,39 @@ class ProductResource(object):
         metadata_type = self.metadata_type_resource.get_by_name(product.metadata_type.name)
         # TODO: should we add metadata type here?
         assert metadata_type, "TODO: should we add metadata type here?"
-        with self._db.begin() as trans:
-            trans.update_dataset_type(
+        with self._db.connect() as conn:
+            conn.update_dataset_type(
                 name=product.name,
                 metadata=product.metadata_doc,
                 metadata_type_id=metadata_type.id,
                 search_fields=metadata_type.dataset_fields,
                 definition=product.definition,
-                update_metadata_type=changing_metadata_type
+                update_metadata_type=changing_metadata_type,
+                concurrently=not allow_table_lock
             )
 
         self.get_by_name_unsafe.cache_clear()
         self.get_unsafe.cache_clear()
 
-    def update_document(self, definition, allow_unsafe_updates=False):
+    def update_document(self, definition, allow_unsafe_updates=False, allow_table_lock=False):
         """
-        Update a Product using its difinition
+        Update a Product using its definition
 
         :param bool allow_unsafe_updates: Allow unsafe changes. Use with caution.
         :param dict definition: product definition document
+        :param allow_table_lock:
+            Allow an exclusive lock to be taken on the table while creating the indexes.
+            This will halt other user's requests until completed.
+
+            If false, creation will be slower and cannot be done in a transaction.
         :rtype: datacube.model.DatasetType
         """
         type_ = self.from_doc(definition)
-        return self.update(type_, allow_unsafe_updates=allow_unsafe_updates)
+        return self.update(
+            type_,
+            allow_unsafe_updates=allow_unsafe_updates,
+            allow_table_lock=allow_table_lock,
+        )
 
     def add_document(self, definition):
         """
@@ -514,6 +552,9 @@ class ProductResource(object):
                 if not field:
                     # This type doesn't have that field, so it cannot match.
                     break
+                if not hasattr(field, 'extract'):
+                    # non-document/native field
+                    continue
                 if field.extract(type_.metadata_doc) is None:
                     # It has this field but it's not defined in the type doc, so it's unmatchable.
                     continue
@@ -811,24 +852,32 @@ class DatasetResource(object):
             out.update(type_.metadata_type.dataset_fields)
         return out
 
-    def get_locations(self, dataset):
+    def get_locations(self, id_):
         """
-        :param datacube.model.Dataset dataset: dataset
+        :param typing.Union[UUID, str] id_: dataset id
         :rtype: list[str]
         """
-        with self._db.connect() as connection:
-            return connection.get_locations(dataset.id)
+        if isinstance(id_, Dataset):
+            warnings.warn("Passing dataset is deprecated after 1.2.2, pass dataset.id", DeprecationWarning)
+            id_ = id_.id
 
-    def add_location(self, dataset, uri):
+        with self._db.connect() as connection:
+            return connection.get_locations(id_)
+
+    def add_location(self, id_, uri):
         """
         Add a location to the dataset if it doesn't already exist.
-        :param datacube.model.Dataset dataset: dataset
+        :param typing.Union[UUID, str] id_: dataset id
         :param str uri: fully qualified uri
         :returns bool: Was one added?
         """
+        if isinstance(id_, Dataset):
+            warnings.warn("Passing dataset is deprecated after 1.2.2, pass dataset.id", DeprecationWarning)
+            id_ = id_.id
+
         with self._db.connect() as connection:
             try:
-                connection.ensure_dataset_location(dataset.id, uri)
+                connection.ensure_dataset_location(id_, uri)
                 return True
             except DuplicateRecordError:
                 return False
@@ -837,15 +886,19 @@ class DatasetResource(object):
         with self._db.connect() as connection:
             return (self._make(row) for row in connection.get_datasets_for_location(uri))
 
-    def remove_location(self, dataset, uri):
+    def remove_location(self, id_, uri):
         """
         Remove a location from the dataset if it exists.
-        :param datacube.model.Dataset dataset: dataset
+        :param typing.Union[UUID, str] id_: dataset id
         :param str uri: fully qualified uri
         :returns bool: Was one removed?
         """
+        if isinstance(id_, Dataset):
+            warnings.warn("Passing dataset is deprecated after 1.2.2, pass dataset.id", DeprecationWarning)
+            id_ = id_.id
+
         with self._db.connect() as connection:
-            was_removed = connection.remove_location(dataset.id, uri)
+            was_removed = connection.remove_location(id_, uri)
             return was_removed
 
     def _make(self, dataset_res, full_info=False):

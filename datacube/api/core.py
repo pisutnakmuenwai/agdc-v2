@@ -336,10 +336,6 @@ class Datacube(object):
         """
         Find datasets for a product.
 
-        .. note:
-            This is a lower level function than most people will use. See :meth:`load` for
-            a simpler to use function.
-
         :param kwargs: see :class:`datacube.api.query.Query`
         :return: list of datasets
         :rtype: list[:class:`datacube.model.Dataset`]
@@ -409,7 +405,8 @@ class Datacube(object):
             list of measurement dicts with keys: {'name', 'dtype', 'nodata', 'units'}
 
         :param data_func:
-            function to fill the data
+            function to fill the storage with data. It is called once for each measurement, with the measurement
+            as an argument. It should return an appropriately shaped numpy array.
 
         :rtype: :class:`xarray.Dataset`
 
@@ -490,7 +487,8 @@ class Datacube(object):
             def data_func(measurement):
                 return _make_dask_array(sources, geobox, measurement, fuse_func, dask_chunks)
 
-        return Datacube.create_storage(sources.coords, geobox, measurements, data_func)
+        return Datacube.create_storage(OrderedDict((dim, sources.coords[dim]) for dim in sources.dims),
+                                       geobox, measurements, data_func)
 
     @staticmethod
     def measurement_data(sources, geobox, measurement, fuse_func=None, dask_chunks=None):

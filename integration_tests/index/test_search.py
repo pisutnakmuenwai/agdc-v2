@@ -476,6 +476,7 @@ def test_search_or_expressions(index,
 
 
 def test_search_returning(index, pseudo_ls8_type, pseudo_ls8_dataset, indexed_ls5_scene_dataset_types):
+    # type: (Index, DatasetType, Dataset, list) -> None
     """
     :type index: datacube.index._api.Index
     """
@@ -492,6 +493,16 @@ def test_search_returning(index, pseudo_ls8_type, pseudo_ls8_dataset, indexed_ls
     # TODO: output nicer types?
     assert path_range == NumericRange(Decimal('116'), Decimal('116'), '[]')
     assert sat_range == NumericRange(Decimal('74'), Decimal('84'), '[]')
+
+    results = list(index.datasets.search_returning(
+        ('id', 'metadata_doc',),
+        platform='LANDSAT_8',
+        instrument='OLI_TIRS',
+    ))
+    assert len(results) == 1
+    id, document = results[0]
+    assert id == pseudo_ls8_dataset.id
+    assert document == pseudo_ls8_dataset.metadata_doc
 
 
 def test_search_returning_rows(index, pseudo_ls8_type,
@@ -511,7 +522,7 @@ def test_search_returning_rows(index, pseudo_ls8_type,
 
     # Add a location to the dataset and we should get one result
     test_uri = 'file:///tmp/test1'
-    index.datasets.add_location(dataset, test_uri)
+    index.datasets.add_location(dataset.id, test_uri)
     results = list(index.datasets.search_returning(
         ('id', 'uri'),
         platform='LANDSAT_8',
@@ -522,7 +533,7 @@ def test_search_returning_rows(index, pseudo_ls8_type,
 
     # Add a second location and we should get two results
     test_uri2 = 'file:///tmp/test2'
-    index.datasets.add_location(dataset, test_uri2)
+    index.datasets.add_location(dataset.id, test_uri2)
     results = set(index.datasets.search_returning(
         ('id', 'uri'),
         platform='LANDSAT_8',
@@ -536,7 +547,7 @@ def test_search_returning_rows(index, pseudo_ls8_type,
 
     # A second dataset now has a location too:
     test_uri3 = 'mdss://c10/tmp/something'
-    index.datasets.add_location(pseudo_ls8_dataset2, test_uri3)
+    index.datasets.add_location(pseudo_ls8_dataset2.id, test_uri3)
     # Datasets and locations should still correctly match up...
     results = set(index.datasets.search_returning(
         ('id', 'uri'),
@@ -624,6 +635,16 @@ def test_search_special_fields(index, pseudo_ls8_type, pseudo_ls8_dataset,
         platform='LANDSAT_8',
         flavour='chocolate',
     )
+    assert len(datasets) == 0
+
+
+def test_search_by_uri(index, ls5_dataset_w_children):
+    datasets = index.datasets.search_eager(product=ls5_dataset_w_children.type.name,
+                                           uri=ls5_dataset_w_children.local_uri)
+    assert len(datasets) == 1
+
+    datasets = index.datasets.search_eager(product=ls5_dataset_w_children.type.name,
+                                           uri='file:///x/yz')
     assert len(datasets) == 0
 
 
@@ -923,8 +944,8 @@ def test_cli_info(index, global_integration_cli_args, pseudo_ls8_dataset, pseudo
     :type global_integration_cli_args: tuple[str]
     :type pseudo_ls8_dataset: datacube.model.Dataset
     """
-    index.datasets.add_location(pseudo_ls8_dataset, 'file:///tmp/location1')
-    index.datasets.add_location(pseudo_ls8_dataset, 'file:///tmp/location2')
+    index.datasets.add_location(pseudo_ls8_dataset.id, 'file:///tmp/location1')
+    index.datasets.add_location(pseudo_ls8_dataset.id, 'file:///tmp/location2')
 
     opts = list(global_integration_cli_args)
     opts.extend(
@@ -1136,8 +1157,8 @@ def test_csv_search_via_cli(global_integration_cli_args, pseudo_ls8_type, pseudo
 
 
 # Headers are currently in alphabetical order.
-_EXPECTED_OUTPUT_HEADER = 'dataset_type_id,gsi,id,instrument,lat,lon,metadata_type,metadata_type_id,orbit,' \
-                          'platform,product,product_type,sat_path,sat_row,time,uri'
+_EXPECTED_OUTPUT_HEADER = 'dataset_type_id,gsi,id,instrument,lat,lon,metadata_doc,metadata_type,metadata_type_id,' \
+                          'orbit,platform,product,product_type,sat_path,sat_row,time,uri'
 
 
 def test_csv_structure(global_integration_cli_args, pseudo_ls8_type, ls5_nbar_gtiff_type,

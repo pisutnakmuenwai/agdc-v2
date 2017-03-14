@@ -33,26 +33,32 @@ try:
 except ImportError:
     pass
 
-DATASET_URI_FIELD = DATASET_LOCATION.c.uri_scheme + ':' + DATASET_LOCATION.c.uri_body
+
+def _dataset_uri_field(table):
+    return table.c.uri_scheme + ':' + table.c.uri_body
+
 # Fields for selecting dataset with the latest local uri
+# Need to alias the table otherwise we can get name collisions when joining with dataset_location outside of this query
+SELECTED_DATASET_LOCATION = DATASET_LOCATION.alias('selected_dataset_location')
 _DATASET_SELECT_W_LOCAL = (
     DATASET,
     # The most recent file uri. We may want more advanced path selection in the future...
     select([
-        DATASET_URI_FIELD,
+        _dataset_uri_field(SELECTED_DATASET_LOCATION),
     ]).where(
         and_(
-            DATASET_LOCATION.c.dataset_ref == DATASET.c.id,
-            DATASET_LOCATION.c.uri_scheme == 'file'
+            SELECTED_DATASET_LOCATION.c.dataset_ref == DATASET.c.id,
+            SELECTED_DATASET_LOCATION.c.uri_scheme == 'file'
         )
     ).order_by(
-        DATASET_LOCATION.c.added.desc()
+        SELECTED_DATASET_LOCATION.c.added.desc()
     ).limit(1).label('uri')
 )
+
 # Fields for selecting dataset with a single joined uri (specify join yourself in your query)
 _DATASET_SELECT_W_URI = (
     DATASET,
-    DATASET_URI_FIELD.label('uri')
+    _dataset_uri_field(DATASET_LOCATION).label('uri')
 )
 
 PGCODE_UNIQUE_CONSTRAINT = '23505'
@@ -108,7 +114,11 @@ def get_native_fields():
             'ID of a metadata type',
             DATASET.c.metadata_type_ref
         ),
-
+        'metadata_doc': NativeField(
+            'metadata_doc',
+            'Full metadata document',
+            DATASET.c.metadata
+        ),
         # Fields that can affect row selection
 
         # Note that this field is a single uri: selecting it will result in one-result per uri.
@@ -117,7 +127,7 @@ def get_native_fields():
             'uri',
             "Dataset URI",
             DATASET_LOCATION.c.uri_body,
-            alchemy_expression=DATASET_URI_FIELD,
+            alchemy_expression=_dataset_uri_field(DATASET_LOCATION),
             affects_row_selection=True
         ),
     }
@@ -628,7 +638,8 @@ class PostgresDbAPI(object):
 
         # Initialise search fields.
         self._setup_dataset_type_fields(type_id, name, search_fields, definition['metadata'],
-                                        concurrently=concurrently)
+                                        concurrently=concurrently,
+                                        rebuild_view=True)
         return type_id
 
     def add_metadata_type(self, name, definition, concurrently=False):
@@ -658,13 +669,15 @@ class PostgresDbAPI(object):
 
         search_fields = get_dataset_fields(definition['dataset']['search_fields'])
         self._setup_metadata_type_fields(
-            type_id, name, search_fields, concurrently=concurrently
+            type_id, name, search_fields,
+            concurrently=concurrently,
+            rebuild_views=True,
         )
 
         return type_id
 
-    def check_dynamic_fields(self, concurrently=False, rebuild_all=False):
-        _LOG.info('Checking dynamic views/indexes. (rebuild all = %s)', rebuild_all)
+    def check_dynamic_fields(self, concurrently=False, rebuild_views=False, rebuild_indexes=False):
+        _LOG.info('Checking dynamic views/indexes. (rebuild views=%s, indexes=%s)', rebuild_views, rebuild_indexes)
 
         search_fields = {}
 
@@ -675,17 +688,21 @@ class PostgresDbAPI(object):
                 metadata_type['id'],
                 metadata_type['name'],
                 fields,
-                rebuild_all, concurrently
+                rebuild_indexes=rebuild_indexes,
+                rebuild_views=rebuild_views,
+                concurrently=concurrently,
             )
 
-    def _setup_metadata_type_fields(self, id_, name, fields, rebuild_all=False, concurrently=True):
+    def _setup_metadata_type_fields(self, id_, name, fields,
+                                    rebuild_indexes=False, rebuild_views=False, concurrently=True):
         # Metadata fields are no longer used (all queries are per-dataset-type): exclude all.
         # This will have the effect of removing any old indexes that still exist.
         exclude_fields = tuple(fields)
 
         dataset_filter = and_(DATASET.c.archived == None, DATASET.c.metadata_type_ref == id_)
         dynamic.check_dynamic_fields(self._connection, concurrently, dataset_filter,
-                                     exclude_fields, fields, name, rebuild_all)
+                                     exclude_fields, fields, name,
+                                     rebuild_indexes=rebuild_indexes, rebuild_view=rebuild_views)
 
         for dataset_type in self._get_dataset_types_for_metadata_type(id_):
             self._setup_dataset_type_fields(
@@ -693,17 +710,19 @@ class PostgresDbAPI(object):
                 dataset_type['name'],
                 fields,
                 dataset_type['definition']['metadata'],
-                rebuild_all,
-                concurrently
+                rebuild_view=rebuild_views,
+                rebuild_indexes=rebuild_indexes,
+                concurrently=concurrently
             )
 
     def _setup_dataset_type_fields(self, id_, name, fields, metadata_doc,
-                                   rebuild_all=False, concurrently=True):
+                                   rebuild_indexes=False, rebuild_view=False, concurrently=True):
         dataset_filter = and_(DATASET.c.archived == None, DATASET.c.dataset_type_ref == id_)
         excluded_field_names = tuple(self._get_active_field_names(fields, metadata_doc))
 
         dynamic.check_dynamic_fields(self._connection, concurrently, dataset_filter,
-                                     excluded_field_names, fields, name, rebuild_all)
+                                     excluded_field_names, fields, name,
+                                     rebuild_indexes=rebuild_indexes, rebuild_view=rebuild_view)
 
     @staticmethod
     def _get_active_field_names(fields, metadata_doc):
@@ -736,7 +755,7 @@ class PostgresDbAPI(object):
             record[0]
             for record in self._connection.execute(
                 select([
-                    DATASET_URI_FIELD
+                    _dataset_uri_field(DATASET_LOCATION)
                 ]).where(
                     DATASET_LOCATION.c.dataset_ref == dataset_id
                 ).order_by(

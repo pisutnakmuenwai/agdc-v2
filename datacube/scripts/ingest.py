@@ -90,13 +90,15 @@ def get_app_metadata(config, config_file):
     return doc
 
 
-def get_filename(config, tile_index, sources):
+def get_filename(config, tile_index, sources, **kwargs):
     file_path_template = str(Path(config['location'], config['file_path_template']))
     time_format = '%Y%m%d%H%M%S%f'
     return Path(file_path_template.format(
         tile_index=tile_index,
         start_time=to_datetime(sources.time.values[0]).strftime(time_format),
-        end_time=to_datetime(sources.time.values[-1]).strftime(time_format)))
+        end_time=to_datetime(sources.time.values[-1]).strftime(time_format),
+        version=config['taskfile_version'],
+        **kwargs))
 
 
 def get_measurements(source_type, config):
@@ -139,6 +141,8 @@ def load_config_from_file(index, config):
 
 
 def create_task_list(index, output_type, year, source_type, config):
+    config['taskfile_version'] = int(time.time())
+
     query = {}
     if year:
         query['time'] = Range(datetime(year=year[0], month=1, day=1), datetime(year=year[1] + 1, month=1, day=1))

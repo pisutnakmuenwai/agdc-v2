@@ -154,7 +154,7 @@ def parse_match_rules_options(index, match_rules, dtype, auto_match):
 @click.option('--auto-match', '-a', help="Automatically associate datasets with products by matching metadata",
               is_flag=True, default=False)
 @click.option('--sources-policy', type=click.Choice(['verify', 'ensure', 'skip']), default='verify',
-              help="""'verify' - verify source datasets' metadata
+              help="""'verify' - verify source datasets' metadata (default)
 'ensure' - add source dataset if it doesn't exist
 'skip' - dont add the derived dataset if source dataset doesn't exist""")
 @click.option('--dry-run', help='Check if everything is ok', is_flag=True, default=False)
@@ -266,7 +266,7 @@ def build_dataset_info(index, dataset, show_sources=False, show_derived=False, d
     if dataset.indexed_time is not None:
         info['indexed'] = dataset.indexed_time
 
-    info['locations'] = index.datasets.get_locations(dataset)
+    info['locations'] = index.datasets.get_locations(dataset.id)
     info['fields'] = dataset.metadata.search_fields
 
     if depth < max_depth:
