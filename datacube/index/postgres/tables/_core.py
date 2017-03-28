@@ -18,7 +18,10 @@ SQL_NAMING_CONVENTIONS = {
     "uq": "uq_%(table_name)s_%(column_0_name)s",
     "ck": "ck_%(table_name)s_%(constraint_name)s",
     "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
-    "pk": "pk_%(table_name)s"
+    "pk": "pk_%(table_name)s",
+    # Other prefixes handled outside of sqlalchemy:
+    # dix: dynamic-index, those indexes created automatically based on search field configuration.
+    # tix: test-index, created by hand for testing, particularly in dev.
 }
 SCHEMA_NAME = 'agdc'
 METADATA = MetaData(naming_convention=SQL_NAMING_CONVENTIONS, schema=SCHEMA_NAME)
@@ -113,6 +116,19 @@ def _pg_exists(conn, name):
     return conn.execute("SELECT to_regclass(%s)", name).scalar() is not None
 
 
+def _pg_column_exists(conn, table, column):
+    """
+    Does a postgres object exist?
+    :rtype bool
+    """
+    return conn.execute("""
+                        select 1 from pg_attribute
+                        where attrelid = to_regclass(%s)
+                        and attname = %s
+                        and not attisdropped
+                        """, table, column).scalar() is not None
+
+
 def database_exists(engine):
     """
     Have they init'd this database?
@@ -124,12 +140,15 @@ def schema_is_latest(engine):
     """
     Is the schema up-to-date?
     """
-    is_unification = _pg_exists(engine, schema_qualified('dataset_type'))
-    is_updated = not _pg_exists(engine, schema_qualified('uq_dataset_source_dataset_ref'))
-
     # We may have versioned schema in the future.
-    # For now, we know updates ahve been applied if the dataset_type table exists,
-    return is_unification and is_updated
+    # For now, we know updates have been applied if certain objects exist,
+
+    location_first_index = 'ix_{schema}_dataset_location_dataset_ref'.format(schema=SCHEMA_NAME)
+
+    has_dataset_source_update = not _pg_exists(engine, schema_qualified('uq_dataset_source_dataset_ref'))
+    has_uri_searches = _pg_exists(engine, schema_qualified(location_first_index))
+    has_dataset_location = _pg_column_exists(engine, schema_qualified('dataset_location'), 'archived')
+    return has_dataset_source_update and has_uri_searches and has_dataset_location
 
 
 def update_schema(engine):
@@ -137,21 +156,44 @@ def update_schema(engine):
     if not is_unification:
         raise ValueError('Pre-unification database cannot be updated.')
 
-    # Remove surrogate key from dataset_source: it makes the table larger for no benefit.
+    # Removal of surrogate key from dataset_source: it makes the table larger for no benefit.
     if _pg_exists(engine, schema_qualified('uq_dataset_source_dataset_ref')):
         _LOG.info('Applying surrogate-key update')
         engine.execute("""
         begin;
-          alter table agdc.dataset_source drop constraint pk_dataset_source;
-          alter table agdc.dataset_source drop constraint uq_dataset_source_dataset_ref;
-          alter table agdc.dataset_source add constraint pk_dataset_source primary key(dataset_ref, classifier);
-          alter table agdc.dataset_source drop column id;
+          alter table {schema}.dataset_source drop constraint pk_dataset_source;
+          alter table {schema}.dataset_source drop constraint uq_dataset_source_dataset_ref;
+          alter table {schema}.dataset_source add constraint pk_dataset_source primary key(dataset_ref, classifier);
+          alter table {schema}.dataset_source drop column id;
         commit;
-        """)
+        """.format(schema=SCHEMA_NAME))
         _LOG.info('Completed surrogate-key update')
 
+    # float8range is needed if the user uses the double-range field type.
     if not engine.execute("SELECT 1 FROM pg_type WHERE typname = 'float8range'").scalar():
         engine.execute(TYPES_INIT_SQL)
+
+    if not _pg_column_exists(engine, schema_qualified('dataset_location'), 'archived'):
+        _LOG.info('Applying dataset_location.archived update')
+        engine.execute("""
+          alter table {schema}.dataset_location add column archived TIMESTAMP WITH TIME ZONE
+          """.format(schema=SCHEMA_NAME))
+        _LOG.info('Completed dataset_location.archived update')
+
+    # Update uri indexes to allow dataset search-by-uri.
+    if not _pg_exists(engine, schema_qualified('ix_{schema}_dataset_location_dataset_ref'.format(schema=SCHEMA_NAME))):
+        _LOG.info('Applying uri-search update')
+        engine.execute("""
+        begin;
+          -- Add a separate index by dataset.
+          create index ix_{schema}_dataset_location_dataset_ref on {schema}.dataset_location (dataset_ref);
+
+          -- Replace (dataset, uri) index with (uri, dataset) index.
+          alter table {schema}.dataset_location add constraint uq_dataset_location_uri_scheme unique (uri_scheme, uri_body, dataset_ref);
+          alter table {schema}.dataset_location drop constraint uq_dataset_location_dataset_ref;
+        commit;
+        """.format(schema=SCHEMA_NAME))
+        _LOG.info('Completed uri-search update')
 
 
 def _ensure_role(engine, name, inherits_from=None, add_user=False, create_db=False):
@@ -169,24 +211,37 @@ def _ensure_role(engine, name, inherits_from=None, add_user=False, create_db=Fal
     engine.execute(' '.join(sql))
 
 
-def create_user(conn, username, key, role):
+def _escape_pg_identifier(engine, name):
+    # New (2.7+) versions of psycopg2 have function: extensions.quote_ident()
+    # But it's too bleeding edge right now. We'll ask the server to escape instead, as
+    # these are not performance sensitive.
+    return engine.execute("select quote_ident(%s)", name).scalar()
+
+
+def create_user(conn, username, key, role, description=None):
     if role not in USER_ROLES:
         raise ValueError('Unknown role %r. Expected one of %r' % (role, USER_ROLES))
-
+    username = _escape_pg_identifier(conn, username)
     conn.execute(
         'create user {username} password %s in role {role}'.format(username=username, role=role),
         key
     )
+    if description:
+        conn.execute(
+            'comment on role {username} is %s'.format(username=username), description
+        )
 
 
-def drop_user(engine, username):
-    engine.execute('drop role {username}'.format(username=username))
+def drop_user(engine, *usernames):
+    for username in usernames:
+        engine.execute('drop role {username}'.format(username=_escape_pg_identifier(engine, username)))
 
 
 def grant_role(engine, role, users):
     if role not in USER_ROLES:
         raise ValueError('Unknown role %r. Expected one of %r' % (role, USER_ROLES))
 
+    users = [_escape_pg_identifier(engine, user) for user in users]
     with engine.begin():
         engine.execute('revoke {roles} from {users}'.format(users=', '.join(users), roles=', '.join(USER_ROLES)))
         engine.execute('grant {role} to {users}'.format(users=', '.join(users), role=role))

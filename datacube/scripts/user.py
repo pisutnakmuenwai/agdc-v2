@@ -5,6 +5,8 @@ import base64
 import logging
 import click
 
+from datacube.config import LocalConfig
+from datacube.index._api import Index
 from datacube.ui import click as ui
 from datacube.ui.click import cli
 
@@ -45,14 +47,16 @@ def grant(index, role, users):
 @click.argument('role',
                 type=click.Choice(USER_ROLES), nargs=1)
 @click.argument('user', nargs=1)
+@click.option('--description')
 @ui.pass_index()
 @ui.pass_config
-def create_user(config, index, role, user):
+def create_user(config, index, role, user, description):
+    # type: (LocalConfig, Index, str, str, str) -> None
     """
     Create a User
     """
     password = base64.urlsafe_b64encode(os.urandom(12)).decode('utf-8')
-    index.users.create_user(user, password, role)
+    index.users.create_user(user, password, role, description=description)
 
     click.echo('{host}:{port}:*:{username}:{password}'.format(
         host=config.db_hostname or 'localhost',
@@ -63,11 +67,11 @@ def create_user(config, index, role, user):
 
 
 @user_cmd.command('delete')
-@click.argument('user', nargs=1)
+@click.argument('users', nargs=-1)
 @ui.pass_index()
 @ui.pass_config
-def delete_user(config, index, user):
+def delete_user(config, index, users):
     """
     Delete a User
     """
-    index.users.delete_user(user)
+    index.users.delete_user(*users)

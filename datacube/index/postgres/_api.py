@@ -757,7 +757,21 @@ class PostgresDbAPI(object):
                 select([
                     _dataset_uri_field(DATASET_LOCATION)
                 ]).where(
-                    DATASET_LOCATION.c.dataset_ref == dataset_id
+                    and_(DATASET_LOCATION.c.dataset_ref == dataset_id, DATASET_LOCATION.c.archived == None)
+                ).order_by(
+                    DATASET_LOCATION.c.added.desc()
+                )
+            ).fetchall()
+            ]
+
+    def get_archived_locations(self, dataset_id):
+        return [
+            record[0]
+            for record in self._connection.execute(
+                select([
+                    _dataset_uri_field(DATASET_LOCATION)
+                ]).where(
+                    and_(DATASET_LOCATION.c.dataset_ref == dataset_id, DATASET_LOCATION.c.archived != None)
                 ).order_by(
                     DATASET_LOCATION.c.added.desc()
                 )
@@ -782,6 +796,32 @@ class PostgresDbAPI(object):
         )
         return res.rowcount > 0
 
+    def archive_location(self, dataset_id, uri):
+        scheme, body = _split_uri(uri)
+        res = self._connection.execute(
+            DATASET_LOCATION.update().where(
+                DATASET_LOCATION.c.dataset_ref == dataset_id
+            ).where(
+                DATASET_LOCATION.c.archived == None
+            ).values(
+                archived=func.now()
+            )
+        )
+        return res.rowcount > 0
+
+    def restore_location(self, dataset_id, uri):
+        scheme, body = _split_uri(uri)
+        res = self._connection.execute(
+            DATASET_LOCATION.update().where(
+                DATASET_LOCATION.c.dataset_ref == dataset_id
+            ).where(
+                DATASET_LOCATION.c.archived != None
+            ).values(
+                archived=None
+            )
+        )
+        return res.rowcount > 0
+
     def __repr__(self):
         return "PostgresDb<connection={!r}>".format(self._connection)
 
@@ -800,14 +840,16 @@ class PostgresDbAPI(object):
         for row in result:
             yield tables.from_pg_role(row['role_name']), row['user_name'], row['description']
 
-    def create_user(self, username, password, role):
+    def create_user(self, username, password, role, description=None):
         pg_role = tables.to_pg_role(role)
-        tables.create_user(self._connection, username, password, pg_role)
+        tables.create_user(self._connection, username, password, pg_role, description=description)
 
-    def drop_user(self, username):
-        tables.drop_user(self._connection, username)
+    def drop_users(self, users):
+        # type: (Iterable[str]) -> None
+        tables.drop_user(self._connection, *users)
 
     def grant_role(self, role, users):
+        # type: (str, Iterable[str]) -> None
         """
         Grant a role to a user.
         """
