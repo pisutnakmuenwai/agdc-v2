@@ -5,6 +5,34 @@
 What's New
 ==========
 
+v1.5.1 Purpler Unicorn (13 July 2017)
+-------------------------------------
+
+ - Fix bug #261. Unable to load Australian Rainfall Grid Data. This was as a
+   result of the CRS/Transformation override functionality being broken when
+   using the latest `rasterio` version `1.0a9`
+
+
+v1.5.0 Purple Unicorn (9 July 2017)
+-----------------------------------
+
+Usability Improvements
+~~~~~~~~~~~~~~~~~~~~~~
+
+ - When `datacube dataset add` is unable to add a Dataset to the index, print
+   out the entire Dataset to make it easier to debug the problem.
+
+ - Give `datacube system check` prettier and more readable output.
+
+ - Make `celery` and `redis` optional when installing.
+
+ - Significantly reduced disk space usage for integration tests
+
+ - `Dataset` objects now have an `is_active` field to mirror `is_archived`.
+
+ - Added `index.datasets.get_archived_location_times()` to see when each
+   location was archived.
+
 v1.4.1 (25 May 2017)
 --------------------
 

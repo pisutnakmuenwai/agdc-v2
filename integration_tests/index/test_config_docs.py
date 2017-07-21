@@ -165,7 +165,7 @@ def test_idempotent_add_dataset_type(index, ls5_telem_type, ls5_telem_doc):
     # But if we add the same type with differing properties we should get an error:
     different_telemetry_type = copy.deepcopy(ls5_telem_doc)
     different_telemetry_type['metadata']['ga_label'] = 'something'
-    with pytest.raises(ValueError):
+    with pytest.raises(changes.DocumentMismatchError):
         index.products.add_document(different_telemetry_type)
 
         # TODO: Support for adding/changing search fields?
@@ -205,7 +205,7 @@ def test_update_dataset(index, ls5_telem_doc, example_ls5_nbar_metadata_doc):
     # adding more metadata should always be allowed
     doc = copy.deepcopy(updated.metadata_doc)
     doc['test1'] = {'some': 'thing'}
-    update = Dataset(ls5_telem_type, doc, updated.local_uri)
+    update = Dataset(ls5_telem_type, doc, uris=updated.uris)
     index.datasets.update(update)
     updated = index.datasets.get(dataset.id)
     assert updated.metadata_doc['test1'] == {'some': 'thing'}
@@ -240,7 +240,8 @@ def test_update_dataset(index, ls5_telem_doc, example_ls5_nbar_metadata_doc):
     doc = copy.deepcopy(updated.metadata_doc)
     doc['product_type'] = 'foobar'
     # Backwards compat: third argument was a single local uri.
-    update = Dataset(ls5_telem_type, doc, 'file:///test/doc4.yaml')
+    with pytest.warns(DeprecationWarning):
+        update = Dataset(ls5_telem_type, doc, 'file:///test/doc4.yaml')
     index.datasets.update(update, {('product_type',): changes.allow_any})
     updated = index.datasets.get(dataset.id)
     assert updated.metadata_doc['test1'] == {'some': 'thing'}

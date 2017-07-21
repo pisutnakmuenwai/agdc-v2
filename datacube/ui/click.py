@@ -31,7 +31,7 @@ def _print_version(ctx, param, value):
 
     click.echo(
         '{prog}, version {version}'.format(
-            prog='Data Cube',
+            prog='Open Data Cube core',
             version=__version__
         )
     )
@@ -185,9 +185,10 @@ def pass_index(app_name=None, expect_initialised=True):
         def with_index(*args, **kwargs):
             ctx = click.get_current_context()
             try:
-                index = index_connect(ctx.obj['config_file'],
+                index = index_connect(ctx.obj.get('config_file') if ctx.obj else None,
                                       application_name=app_name or ctx.command_path,
                                       validate_connection=expect_initialised)
+                ctx.obj['index'] = index
                 _LOG.debug("Connected to datacube index: %s", index)
                 return f(index, *args, **kwargs)
             except (OperationalError, ProgrammingError) as e:
@@ -196,6 +197,18 @@ def pass_index(app_name=None, expect_initialised=True):
         return functools.update_wrapper(with_index, f)
 
     return decorate
+
+
+def connect_to_index(app_name=None, expect_initialised=True):
+    ctx = click.get_current_context()
+    try:
+        index = index_connect(ctx.obj['config_file'],
+                              application_name=app_name or ctx.command_path,
+                              validate_connection=expect_initialised)
+        _LOG.debug("Connected to datacube index: %s", index)
+        return index
+    except (OperationalError, ProgrammingError) as e:
+        handle_exception('Error Connecting to database: %s', e)
 
 
 def parse_endpoint(value):

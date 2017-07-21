@@ -1,4 +1,3 @@
-#    Copyright 2015 Geoscience Australia
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -124,7 +123,6 @@ class Query(object):
 class DescriptorQuery(Query):
     def __init__(self, descriptor_request=None):
         super(DescriptorQuery, self).__init__()
-        warnings.warn("Descriptor interface is deprecated.", DeprecationWarning)
 
         if descriptor_request is None:
             descriptor_request = {}

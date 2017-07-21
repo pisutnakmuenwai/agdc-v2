@@ -5,7 +5,6 @@ Utility functions used in storage modules
 from __future__ import absolute_import, division, print_function
 
 import os
-import stat
 import gzip
 import importlib
 import itertools
@@ -14,6 +13,7 @@ import logging
 import pathlib
 import re
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import datetime, date
 from itertools import chain
 from math import ceil
@@ -328,7 +328,7 @@ def validate_document(document, schema, schema_folder=None):
         validator = jsonschema.Draft4Validator(schema, resolver=ref_resolver)
         validator.validate(document)
     except jsonschema.ValidationError as e:
-        raise InvalidDocException(e.message)
+        raise InvalidDocException(e)
 
 
 # TODO: Replace with Pandas
@@ -716,7 +716,7 @@ def write_user_secret_file(text, fname, in_home_dir=False, mode='w'):
         fname = os.path.join(os.environ['HOME'], fname)
 
     open_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    access = stat.S_IRUSR | stat.S_IWUSR  # Make sure file is readable by current user only
+    access = 0o600  # Make sure file is readable by current user only
     with os.fdopen(os.open(fname, open_flags, access), mode) as handle:
         handle.write(text)
         handle.close()
@@ -743,3 +743,15 @@ def gen_password(num_random_bytes=12):
     """
     import base64
     return base64.urlsafe_b64encode(os.urandom(num_random_bytes)).decode('utf-8')
+
+
+@contextmanager
+def ignore_exceptions_if(ignore_errors):
+    """Ignore Exceptions raised within this block if ignore_errors is True"""
+    if ignore_errors:
+        try:
+            yield
+        except OSError as e:
+            _LOG.warning('Ignoring Exception: %s', e)
+    else:
+        yield
