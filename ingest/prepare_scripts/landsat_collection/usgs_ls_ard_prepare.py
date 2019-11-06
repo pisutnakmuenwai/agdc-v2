@@ -163,8 +163,12 @@ def get_projection(path):
 
 def get_coords(geo_ref_points, spatial_ref):
     spatial_ref = osr.SpatialReference(spatial_ref)
-    t = osr.CoordinateTransformation(spatial_ref, spatial_ref.CloneGeogCS())
-
+    geogcs_ref = spatial_ref.CloneGeogCS()
+    if "GetPROJVersionMajor" in dir(osr) and osr.GetPROJVersionMajor()>=6:#gdal>=3.0
+        spatial_ref.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        geogcs_ref.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    t = osr.CoordinateTransformation(spatial_ref, geogcs_ref)
+    
     def transform(p):
         lon, lat, z = t.TransformPoint(p['x'], p['y'])
         return {'lon': lon, 'lat': lat}
